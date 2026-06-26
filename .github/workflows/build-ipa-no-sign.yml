@@ -1,0 +1,103 @@
+name: Build Unsigned IPA to Releases
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+
+    defaults:
+      run:
+        working-directory: ./ipa
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ipa/package-lock.json
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Expo Prebuild
+        env:
+          EXPO_PUBLIC_GOOGLE_DRIVE_API_KEY: ${{ secrets.GOOGLE_DRIVE_API_KEY }}
+          EXPO_PUBLIC_GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+        run: npx expo prebuild --platform ios --clean
+
+      - name: Install Pods
+        run: |
+          cd ios
+          pod install
+
+      - name: Force Disable Signing via Ruby
+        run: |
+          cd ios
+          gem install xcodeproj
+          ruby -e '
+            require "xcodeproj"
+            project_path = Dir.glob("*.xcodeproj").first
+            project = Xcodeproj::Project.open(project_path)
+
+            project.targets.each do |target|
+              target.build_configurations.each do |config|
+                config.build_settings["CODE_SIGN_STYLE"] = "Manual"
+                config.build_settings["DEVELOPMENT_TEAM"] = ""
+                config.build_settings["PROVISIONING_PROFILE_SPECIFIER"] = ""
+                config.build_settings["CODE_SIGNING_REQUIRED"] = "NO"
+                config.build_settings["CODE_SIGNING_ALLOWED"] = "NO"
+                config.build_settings["CODE_SIGN_IDENTITY"] = ""
+              end
+            end
+
+            project.save
+          '
+          echo "✅ Đã ép tắt chứng chỉ bằng Ruby thành công!"
+
+      - name: Build Archive No Signing
+        run: |
+          mkdir -p build
+          cd ios
+          SCHEME=$(basename *.xcworkspace .xcworkspace)
+          echo "Detected Scheme: $SCHEME"
+
+          xcodebuild archive \
+            -workspace *.xcworkspace \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -archivePath ../build/MyApp.xcarchive \
+            -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Create IPA from Archive
+        run: |
+          mkdir -p build/Payload
+          mv build/MyApp.xcarchive/Products/Applications/*.app build/Payload/
+          cd build
+          zip -r -9 TruyenTep.ipa Payload
+
+      - name: Generate Tag Name
+        id: tag
+        run: |
+          echo "release_tag=build-$(date +'%Y.%m.%d-%H%M')" >> $GITHUB_OUTPUT
+
+      - name: Release to GitHub
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          name: Bản Build ${{ steps.tag.outputs.release_tag }}
+          body: "Bản build không chứng chỉ Unsigned. Dùng ESign/Scarlet để ký trước khi cài."
+          files: ipa/build/TruyenTep.ipa
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

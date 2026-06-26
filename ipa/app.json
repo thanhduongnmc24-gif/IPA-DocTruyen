@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "Doc Truyen",
+    "slug": "doc-truyen-drive",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "bundleIdentifier": "com.anhhai.doctruyen",
+      "supportsTablet": true
+    }
+  }
+}
