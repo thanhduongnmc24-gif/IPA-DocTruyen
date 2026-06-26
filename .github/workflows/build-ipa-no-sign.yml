@@ -14,6 +14,11 @@ jobs:
       run:
         working-directory: ./ipa
 
+    env:
+      EXPO_PUBLIC_GOOGLE_DRIVE_API_KEY: ${{ secrets.GOOGLE_DRIVE_API_KEY }}
+      EXPO_PUBLIC_GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+      EXPO_PUBLIC_USE_RN_FETCH: 1
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,13 +30,22 @@ jobs:
           cache: npm
           cache-dependency-path: ipa/package-lock.json
 
+      - name: Create Expo env file
+        run: |
+          cat > .env <<EOF
+          EXPO_PUBLIC_GOOGLE_DRIVE_API_KEY=${EXPO_PUBLIC_GOOGLE_DRIVE_API_KEY}
+          EXPO_PUBLIC_GOOGLE_DRIVE_FOLDER_ID=${EXPO_PUBLIC_GOOGLE_DRIVE_FOLDER_ID}
+          EXPO_PUBLIC_USE_RN_FETCH=1
+          EOF
+
+          echo "✅ Đã tạo file .env cho Expo build"
+          echo "API key length: ${#EXPO_PUBLIC_GOOGLE_DRIVE_API_KEY}"
+          echo "Folder ID length: ${#EXPO_PUBLIC_GOOGLE_DRIVE_FOLDER_ID}"
+
       - name: Install dependencies
         run: npm install
 
       - name: Expo Prebuild
-        env:
-          EXPO_PUBLIC_GOOGLE_DRIVE_API_KEY: ${{ secrets.GOOGLE_DRIVE_API_KEY }}
-          EXPO_PUBLIC_GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
         run: npx expo prebuild --platform ios --clean
 
       - name: Install Pods
