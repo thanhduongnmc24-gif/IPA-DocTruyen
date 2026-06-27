@@ -12,25 +12,25 @@ import {
   Modal
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 
 const API_KEY = process.env.EXPO_PUBLIC_GOOGLE_DRIVE_API_KEY;
 const ROOT_FOLDER_ID = process.env.EXPO_PUBLIC_GOOGLE_DRIVE_FOLDER_ID;
 
 const FOLDER_MIME = "application/vnd.google-apps.folder";
 const CHAPTER_GROUP_SIZE = 50;
+const READING_STATE_KEY = "DOC_TRUYEN_READING_STATE_V1";
 
 export default function App() {
   const folderCacheRef = useRef({});
   const chapterContentCacheRef = useRef({});
   const prefetchingRef = useRef({});
   const lastScrollYRef = useRef(0);
-  const autoNextLockRef = useRef(false);
-  const autoNextTimerRef = useRef(null);
-  const nextPromptVisibleRef = useRef(false);
-  const nextPromptReadyAtRef = useRef(0);
+  const lastSaveScrollAtRef = useRef(0);
   const readerScrollRef = useRef(null);
   const changingChapterRef = useRef(false);
-
+  const nextPromptVisibleRef = useRef(false);
+  const nextPromptReadyAtRef = useRef(0);
 
   const [folderStack, setFolderStack] = useState([
     {
@@ -55,7 +55,7 @@ export default function App() {
   const currentFolder = folderStack[folderStack.length - 1];
 
   useEffect(() => {
-    loadFolder(currentFolder);
+    initApp();
   }, []);
 
   const currentChapterIndex = useMemo(() => {
@@ -100,6 +100,91 @@ export default function App() {
     return `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
   }
 
+  function setNextPrompt(show) {
+    nextPromptVisibleRef.current = show;
+    setNextPromptVisible(show);
+
+    if (show) {
+      nextPromptReadyAtRef.current = Date.now() + 700;
+    } else {
+      nextPromptReadyAtRef.current = 0;
+    }
+  }
+
+  async function saveReadingState(
+    scrollY = 0,
+    chapterOverride = null,
+    folderStackOverride = null
+  ) {
+    const chapter = chapterOverride || selectedChapter;
+    const stack = folderStackOverride || folderStack;
+
+    if (!chapter) return;
+
+    try {
+      const data = {
+        folderStack: stack,
+        chapterId: chapter.id,
+        chapterName: chapter.name,
+        scrollY,
+        savedAt: Date.now()
+      };
+
+      await AsyncStorage.setItem(READING_STATE_KEY, JSON.stringify(data));
+    } catch {
+      // Bỏ qua lỗi lưu trạng thái để app không crash.
+    }
+  }
+
+  async function initApp() {
+    try {
+      const raw = await AsyncStorage.getItem(READING_STATE_KEY);
+
+      if (!raw) {
+        await loadFolder(currentFolder);
+        return;
+      }
+
+      const saved = JSON.parse(raw);
+
+      if (!saved?.folderStack?.length || !saved?.chapterId) {
+        await loadFolder(currentFolder);
+        return;
+      }
+
+      const savedStack = saved.folderStack;
+      const lastFolder = savedStack[savedStack.length - 1];
+
+      setFolderStack(savedStack);
+
+      const folderData = await loadFolder(lastFolder, true);
+
+      if (!folderData?.chapters?.length) {
+        await loadFolder(lastFolder);
+        return;
+      }
+
+      const savedChapter = folderData.chapters.find(
+        (item) => item.id === saved.chapterId
+      );
+
+      if (!savedChapter) {
+        setMode("chapters");
+        setFolders([]);
+        setChapters(folderData.chapters);
+        return;
+      }
+
+      setMode("chapters");
+      setFolders([]);
+      setChapters(folderData.chapters);
+
+      await openChapter(savedChapter, saved.scrollY || 0, folderData.chapters, savedStack);
+    } catch {
+      await loadFolder(currentFolder);
+    }
+  }
+
   async function driveListChildren(folderId, extraQuery = "") {
     let allFiles = [];
     let pageToken = "";
@@ -130,7 +215,9 @@ export default function App() {
       const json = await res.json();
 
       if (!res.ok) {
-        throw new Error(json.error?.message || "Không tải được dữ liệu Google Drive");
+        throw new Error(
+          json.error?.message || "Không tải được dữ liệu Google Drive"
+        );
       }
 
       allFiles = allFiles.concat(json.files || []);
@@ -154,24 +241,30 @@ export default function App() {
     }
   }
 
-  async function loadFolder(folder) {
+  async function loadFolder(folder, returnDataOnly = false) {
     try {
       setErrorText("");
       setSelectedChapter(null);
       setChapterContent("");
       setTocVisible(false);
       setTocGroupIndex(0);
+      setNextPrompt(false);
 
       const cached = folderCacheRef.current[folder.id];
 
       if (cached) {
-        setMode(cached.mode);
-        setFolders(cached.folders || []);
-        setChapters(cached.chapters || []);
-        return;
+        if (!returnDataOnly) {
+          setMode(cached.mode);
+          setFolders(cached.folders || []);
+          setChapters(cached.chapters || []);
+        }
+
+        return cached;
       }
 
-      setLoading(true);
+      if (!returnDataOnly) {
+        setLoading(true);
+      }
 
       const children = await driveListChildren(folder.id);
       const txtFiles = children.filter(isTextFile);
@@ -186,10 +279,13 @@ export default function App() {
 
         folderCacheRef.current[folder.id] = data;
 
-        setMode("chapters");
-        setFolders([]);
-        setChapters(txtFiles);
-        return;
+        if (!returnDataOnly) {
+          setMode("chapters");
+          setFolders([]);
+          setChapters(txtFiles);
+        }
+
+        return data;
       }
 
       const foldersWithCover = await Promise.all(
@@ -211,13 +307,20 @@ export default function App() {
 
       folderCacheRef.current[folder.id] = data;
 
-      setMode("folders");
-      setFolders(foldersWithCover);
-      setChapters([]);
+      if (!returnDataOnly) {
+        setMode("folders");
+        setFolders(foldersWithCover);
+        setChapters([]);
+      }
+
+      return data;
     } catch (error) {
       setErrorText(error.message);
+      return null;
     } finally {
-      setLoading(false);
+      if (!returnDataOnly) {
+        setLoading(false);
+      }
     }
   }
 
@@ -253,8 +356,8 @@ export default function App() {
     return text;
   }
 
-  async function prefetchNextChapter(chapterIndex) {
-    const nextChapter = chapters[chapterIndex + 1];
+  async function prefetchNextChapter(chapterIndex, chapterList = chapters) {
+    const nextChapter = chapterList[chapterIndex + 1];
 
     if (!nextChapter) return;
     if (chapterContentCacheRef.current[nextChapter.id]) return;
@@ -270,56 +373,56 @@ export default function App() {
     }
   }
 
-  async function openChapter(chapter) {
-  try {
-    changingChapterRef.current = true;
-    setLoading(true);
-    setErrorText("");
-    setSelectedChapter(chapter);
-    setChapterContent("");
-    setTocVisible(false);
-    lastScrollYRef.current = 0;
-    autoNextLockRef.current = false;
-    setNextPrompt(false);
-    if (autoNextTimerRef.current) {
-      clearTimeout(autoNextTimerRef.current);
-      autoNextTimerRef.current = null;
-    }
+  async function openChapter(
+    chapter,
+    restoreScrollY = 0,
+    chapterList = chapters,
+    folderStackOverride = folderStack
+  ) {
+    try {
+      changingChapterRef.current = true;
+      setLoading(true);
+      setErrorText("");
+      setSelectedChapter(chapter);
+      setChapterContent("");
+      setTocVisible(false);
+      setNextPrompt(false);
+      lastScrollYRef.current = 0;
 
-    readerScrollRef.current?.scrollTo({
-      y: 0,
-      animated: false
-    });
-
-    const text = await fetchChapterContent(chapter);
-
-    setChapterContent(text);
-    setMode("reader");
-
-    setTimeout(() => {
       readerScrollRef.current?.scrollTo({
         y: 0,
         animated: false
       });
 
-      lastScrollYRef.current = 0;
-      autoNextLockRef.current = false;
+      const text = await fetchChapterContent(chapter);
+
+      setChapterContent(text);
+      setMode("reader");
+
+      const index = chapterList.findIndex((item) => item.id === chapter.id);
+
+      if (index >= 0) {
+        setTocGroupIndex(Math.floor(index / CHAPTER_GROUP_SIZE));
+        prefetchNextChapter(index, chapterList);
+      }
+
+      setTimeout(() => {
+        readerScrollRef.current?.scrollTo({
+          y: restoreScrollY || 0,
+          animated: false
+        });
+
+        lastScrollYRef.current = restoreScrollY || 0;
+        changingChapterRef.current = false;
+        saveReadingState(restoreScrollY || 0, chapter, folderStackOverride);
+      }, 500);
+    } catch (error) {
       changingChapterRef.current = false;
-    }, 150);
-
-    const index = chapters.findIndex((item) => item.id === chapter.id);
-
-    if (index >= 0) {
-      setTocGroupIndex(Math.floor(index / CHAPTER_GROUP_SIZE));
-      prefetchNextChapter(index);
+      setErrorText(error.message);
+    } finally {
+      setLoading(false);
     }
-  } catch (error) {
-    changingChapterRef.current = false;
-    setErrorText(error.message);
-  } finally {
-    setLoading(false);
   }
-}
 
   async function openNextChapter() {
     if (currentChapterIndex < 0) return;
@@ -328,77 +431,78 @@ export default function App() {
 
     if (!nextChapter) return;
 
-    await openChapter(nextChapter);
+    await openChapter(nextChapter, 0, chapters, folderStack);
   }
 
   function handleReaderScroll(event) {
-  if (changingChapterRef.current) {
-    return;
+    if (changingChapterRef.current) {
+      return;
+    }
+
+    const nativeEvent = event.nativeEvent;
+    const y = nativeEvent.contentOffset.y;
+    const viewportHeight = nativeEvent.layoutMeasurement.height;
+    const contentHeight = nativeEvent.contentSize.height;
+
+    const maxY = Math.max(contentHeight - viewportHeight, 0);
+    const distanceToBottom = maxY - y;
+
+    lastScrollYRef.current = y;
+
+    const now = Date.now();
+
+    if (selectedChapter && now - lastSaveScrollAtRef.current > 800) {
+      lastSaveScrollAtRef.current = now;
+      saveReadingState(y);
+    }
+
+    if (distanceToBottom > 180 && nextPromptVisibleRef.current) {
+      setNextPrompt(false);
+    }
   }
 
-  const nativeEvent = event.nativeEvent;
-  const y = nativeEvent.contentOffset.y;
-  const viewportHeight = nativeEvent.layoutMeasurement.height;
-  const contentHeight = nativeEvent.contentSize.height;
+  function handleReaderEndDrag(event) {
+    if (changingChapterRef.current) {
+      return;
+    }
 
-  const maxY = Math.max(contentHeight - viewportHeight, 0);
-  const distanceToBottom = maxY - y;
+    if (currentChapterIndex < 0 || currentChapterIndex >= chapters.length - 1) {
+      return;
+    }
 
-  lastScrollYRef.current = y;
+    const nativeEvent = event.nativeEvent;
+    const y = nativeEvent.contentOffset.y;
+    const viewportHeight = nativeEvent.layoutMeasurement.height;
+    const contentHeight = nativeEvent.contentSize.height;
 
-  // Nếu người dùng kéo lên lại xa đáy thì hủy trạng thái chờ qua chương.
-  if (distanceToBottom > 180 && nextPromptVisibleRef.current) {
+    const maxY = Math.max(contentHeight - viewportHeight, 0);
+    const distanceToBottom = maxY - y;
+    const nearBottom = distanceToBottom < 28;
+
+    if (!nearBottom) {
+      return;
+    }
+
+    if (!nextPromptVisibleRef.current) {
+      setNextPrompt(true);
+      return;
+    }
+
+    if (Date.now() < nextPromptReadyAtRef.current) {
+      return;
+    }
+
     setNextPrompt(false);
-  }
-}
-function handleReaderEndDrag(event) {
-  if (changingChapterRef.current) {
-    return;
+    openNextChapter();
   }
 
-  if (
-    currentChapterIndex < 0 ||
-    currentChapterIndex >= chapters.length - 1
-  ) {
-    return;
-  }
-
-  const nativeEvent = event.nativeEvent;
-  const y = nativeEvent.contentOffset.y;
-  const viewportHeight = nativeEvent.layoutMeasurement.height;
-  const contentHeight = nativeEvent.contentSize.height;
-
-  const maxY = Math.max(contentHeight - viewportHeight, 0);
-  const distanceToBottom = maxY - y;
-  const nearBottom = distanceToBottom < 28;
-
-  if (!nearBottom) {
-    return;
-  }
-
-  if (!nextPromptVisibleRef.current) {
-    setNextPrompt(true);
-    return;
-  }
-
-  if (Date.now() < nextPromptReadyAtRef.current) {
-    return;
-  }
-
-  setNextPrompt(false);
-  openNextChapter();
-}
   async function goBack() {
     setErrorText("");
     setTocVisible(false);
-    autoNextLockRef.current = false;
-
-    if (autoNextTimerRef.current) {
-      clearTimeout(autoNextTimerRef.current);
-      autoNextTimerRef.current = null;
-    }
+    setNextPrompt(false);
 
     if (mode === "reader") {
+      saveReadingState(lastScrollYRef.current);
       setMode("chapters");
       setSelectedChapter(null);
       setChapterContent("");
@@ -439,16 +543,6 @@ function handleReaderEndDrag(event) {
   function decreaseStoryFontSize() {
     setStoryFontSize((oldValue) => Math.max(oldValue - 1, 13));
   }
-  function setNextPrompt(show) {
-  nextPromptVisibleRef.current = show;
-  setNextPromptVisible(show);
-
-  if (show) {
-    nextPromptReadyAtRef.current = Date.now() + 700;
-  } else {
-    nextPromptReadyAtRef.current = 0;
-  }
-}
 
   function renderFolderListItem({ item }) {
     return (
@@ -489,12 +583,17 @@ function handleReaderEndDrag(event) {
   }
 
   function renderChapterItem({ item, index }) {
+    const isReading = selectedChapter?.id === item.id;
+
     return (
       <TouchableOpacity style={styles.chapterItem} onPress={() => openChapter(item)}>
         <Text style={styles.chapterIndex}>{index + 1}</Text>
 
         <View style={styles.chapterInfo}>
-          <Text style={styles.chapterName} numberOfLines={2}>
+          <Text
+            style={[styles.chapterName, isReading ? styles.chapterNameActive : null]}
+            numberOfLines={2}
+          >
             {cleanChapterName(item.name)}
           </Text>
         </View>
@@ -504,16 +603,14 @@ function handleReaderEndDrag(event) {
 
   function renderTocChapterItem({ item }) {
     const chapterIndex = chapters.findIndex((chapter) => chapter.id === item.id);
+    const active = selectedChapter?.id === item.id;
 
     return (
       <TouchableOpacity
-        style={[
-          styles.tocItem,
-          selectedChapter?.id === item.id ? styles.tocItemActive : null
-        ]}
+        style={[styles.tocItem, active ? styles.tocItemActive : null]}
         onPress={() => openChapter(item)}
       >
-        <Text style={styles.tocText}>
+        <Text style={[styles.tocText, active ? styles.tocTextActive : null]}>
           {chapterIndex + 1}. {cleanChapterName(item.name)}
         </Text>
       </TouchableOpacity>
@@ -586,14 +683,14 @@ function handleReaderEndDrag(event) {
         </View>
       ) : mode === "reader" ? (
         <ScrollView
-  ref={readerScrollRef}
-  key={selectedChapter?.id || "reader"}
-  style={styles.reader}
-  contentContainerStyle={styles.readerContent}
-  onScroll={handleReaderScroll}
-  onScrollEndDrag={handleReaderEndDrag}
-  scrollEventThrottle={80}
->
+          ref={readerScrollRef}
+          key={selectedChapter?.id || "reader"}
+          style={styles.reader}
+          contentContainerStyle={styles.readerContent}
+          onScroll={handleReaderScroll}
+          onScrollEndDrag={handleReaderEndDrag}
+          scrollEventThrottle={80}
+        >
           <Text
             style={[
               styles.storyText,
@@ -607,18 +704,18 @@ function handleReaderEndDrag(event) {
           </Text>
 
           {currentChapterIndex >= 0 && currentChapterIndex < chapters.length - 1 ? (
-  <Text style={styles.nextSwipeHint}>
-    {nextPromptVisible
-      ? "Vuốt thêm lần nữa để qua chương sau"
-      : ""}
-  </Text>
-) : (
-  <Text style={styles.nextSwipeHint}>Đã hết chương.</Text>
-)}
+            <Text style={styles.nextSwipeHint}>
+              {nextPromptVisible
+                ? "Vuốt thêm lần nữa để qua chương sau"
+                : ""}
+            </Text>
+          ) : (
+            <Text style={styles.nextSwipeHint}>Đã hết chương.</Text>
+          )}
 
-<Text style={styles.readerProgress}>
-  {currentChapterIndex + 1}/{chapters.length}
-</Text>
+          <Text style={styles.readerProgress}>
+            {currentChapterIndex + 1}/{chapters.length}
+          </Text>
         </ScrollView>
       ) : mode === "chapters" ? (
         <FlatList
@@ -764,7 +861,7 @@ const styles = StyleSheet.create({
     marginHorizontal: 8,
     fontSize: 7,
     fontWeight: "700",
-    color: "#3b2f20",
+    color: "#007aff",
     textAlign: "center"
   },
   iconButton: {
@@ -797,14 +894,6 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: "900"
   },
-  nextSwipeHint: {
-  marginTop: 28,
-  minHeight: 22,
-  textAlign: "center",
-  fontSize: 12,
-  fontWeight: "400",
-  color: "#8b7355"
-},
   list: {
     padding: 14
   },
@@ -903,6 +992,9 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: "#2f2418"
   },
+  chapterNameActive: {
+    color: "#007aff"
+  },
   reader: {
     flex: 1
   },
@@ -916,8 +1008,16 @@ const styles = StyleSheet.create({
     lineHeight: 32,
     color: "#2f2418"
   },
+  nextSwipeHint: {
+    marginTop: 28,
+    minHeight: 22,
+    textAlign: "center",
+    fontSize: 12,
+    fontWeight: "400",
+    color: "#8b7355"
+  },
   readerProgress: {
-    marginTop: 24,
+    marginTop: 8,
     textAlign: "center",
     fontSize: 9,
     fontWeight: "400",
@@ -973,10 +1073,10 @@ const styles = StyleSheet.create({
   },
   fontControls: {
     flexDirection: "row",
-    alignItems: "center",
-    gap: 8
+    alignItems: "center"
   },
   fontButton: {
+    marginRight: 8,
     paddingHorizontal: 10,
     paddingVertical: 7,
     backgroundColor: "#8b5e34",
@@ -1043,5 +1143,8 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: "#2f2418",
     fontWeight: "400"
+  },
+  tocTextActive: {
+    color: "#007aff"
   }
 });
