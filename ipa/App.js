@@ -18,17 +18,27 @@ const API_KEY = process.env.EXPO_PUBLIC_GOOGLE_DRIVE_API_KEY;
 const ROOT_FOLDER_ID = process.env.EXPO_PUBLIC_GOOGLE_DRIVE_FOLDER_ID;
 
 const FOLDER_MIME = "application/vnd.google-apps.folder";
-const CHAPTER_GROUP_SIZE = 50;
-const READING_STATE_KEY = "DOC_TRUYEN_READING_STATE_V1";
+const READING_STATE_KEY = "DOC_TRUYEN_READING_STATES_V4";
+
+const TOC_WINDOW_SIZE = 51;
+const TOC_ITEMS_BEFORE_CURRENT = 3;
+const CHAPTER_ITEMS_BEFORE_CURRENT = 3;
+
+const CHAPTER_ROW_HEIGHT = 73;
+const TOC_ROW_HEIGHT = 54;
 
 export default function App() {
   const folderCacheRef = useRef({});
   const chapterContentCacheRef = useRef({});
   const prefetchingRef = useRef({});
+  const readingStatesRef = useRef({});
+
+  const readerScrollRef = useRef(null);
+
   const lastScrollYRef = useRef(0);
   const lastSaveScrollAtRef = useRef(0);
-  const readerScrollRef = useRef(null);
   const changingChapterRef = useRef(false);
+
   const nextPromptVisibleRef = useRef(false);
   const nextPromptReadyAtRef = useRef(0);
 
@@ -43,14 +53,21 @@ export default function App() {
   const [chapters, setChapters] = useState([]);
   const [selectedChapter, setSelectedChapter] = useState(null);
   const [chapterContent, setChapterContent] = useState("");
+
   const [loading, setLoading] = useState(false);
   const [mode, setMode] = useState("folders");
   const [errorText, setErrorText] = useState("");
+
   const [viewMode, setViewMode] = useState("list");
   const [tocVisible, setTocVisible] = useState(false);
-  const [tocGroupIndex, setTocGroupIndex] = useState(0);
+  const [tocStartIndex, setTocStartIndex] = useState(0);
+  const [chapterListInitialIndex, setChapterListInitialIndex] = useState(0);
+
   const [storyFontSize, setStoryFontSize] = useState(19);
   const [nextPromptVisible, setNextPromptVisible] = useState(false);
+
+  const [readingStates, setReadingStates] = useState({});
+  const [lastReadingFolderId, setLastReadingFolderId] = useState(null);
 
   const currentFolder = folderStack[folderStack.length - 1];
 
@@ -63,16 +80,12 @@ export default function App() {
     return chapters.findIndex((item) => item.id === selectedChapter.id);
   }, [chapters, selectedChapter]);
 
-  const currentTocChapters = useMemo(() => {
-    const start = tocGroupIndex * CHAPTER_GROUP_SIZE;
-    const end = start + CHAPTER_GROUP_SIZE;
-    return chapters.slice(start, end);
-  }, [chapters, tocGroupIndex]);
+  const currentStoryReadingState = readingStates[currentFolder?.id];
+  const savedChapterIdForCurrentStory = currentStoryReadingState?.chapterId;
 
-  const totalTocGroups = Math.max(
-    1,
-    Math.ceil(chapters.length / CHAPTER_GROUP_SIZE)
-  );
+  const currentTocChapters = useMemo(() => {
+    return chapters.slice(tocStartIndex, tocStartIndex + TOC_WINDOW_SIZE);
+  }, [chapters, tocStartIndex]);
 
   function isTextFile(file) {
     return file.name?.toLowerCase().endsWith(".txt");
@@ -100,6 +113,24 @@ export default function App() {
     return `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
   }
 
+  function getTocStartByChapterIndex(index, chapterList = chapters) {
+    if (index < 0) return 0;
+
+    const maxStart = Math.max(chapterList.length - TOC_WINDOW_SIZE, 0);
+    const wantedStart = index - TOC_ITEMS_BEFORE_CURRENT;
+
+    return Math.max(0, Math.min(wantedStart, maxStart));
+  }
+
+  function getChapterListStartByChapterIndex(index, chapterList = chapters) {
+    if (index < 0) return 0;
+
+    const maxStart = Math.max(chapterList.length - 1, 0);
+    const wantedStart = index - CHAPTER_ITEMS_BEFORE_CURRENT;
+
+    return Math.max(0, Math.min(wantedStart, maxStart));
+  }
+
   function setNextPrompt(show) {
     nextPromptVisibleRef.current = show;
     setNextPromptVisible(show);
@@ -111,49 +142,109 @@ export default function App() {
     }
   }
 
+  function openToc() {
+    const index =
+      currentChapterIndex >= 0
+        ? currentChapterIndex
+        : chapters.findIndex((item) => item.id === savedChapterIdForCurrentStory);
+
+    const startIndex = getTocStartByChapterIndex(index, chapters);
+
+    setTocStartIndex(startIndex);
+    setTocVisible(true);
+  }
+
+  async function loadReadingStates() {
+    try {
+      const raw = await AsyncStorage.getItem(READING_STATE_KEY);
+
+      if (!raw) {
+        return {
+          states: {},
+          lastFolderId: null
+        };
+      }
+
+      const parsed = JSON.parse(raw);
+
+      return {
+        states: parsed.states || {},
+        lastFolderId: parsed.lastReadingFolderId || null
+      };
+    } catch {
+      return {
+        states: {},
+        lastFolderId: null
+      };
+    }
+  }
+
+  async function persistReadingStates(nextStates, nextLastFolderId) {
+    try {
+      await AsyncStorage.setItem(
+        READING_STATE_KEY,
+        JSON.stringify({
+          states: nextStates,
+          lastReadingFolderId: nextLastFolderId
+        })
+      );
+    } catch {
+      // Bỏ qua lỗi lưu để app không crash.
+    }
+  }
+
   async function saveReadingState(
     scrollY = 0,
     chapterOverride = null,
-    folderStackOverride = null
+    folderStackOverride = null,
+    folderIdOverride = null
   ) {
     const chapter = chapterOverride || selectedChapter;
     const stack = folderStackOverride || folderStack;
+    const storyFolderId = folderIdOverride || stack[stack.length - 1]?.id;
 
-    if (!chapter) return;
+    if (!chapter || !storyFolderId) return;
 
-    try {
-      const data = {
+    const nextStates = {
+      ...readingStatesRef.current,
+      [storyFolderId]: {
+        folderId: storyFolderId,
         folderStack: stack,
         chapterId: chapter.id,
         chapterName: chapter.name,
         scrollY,
         savedAt: Date.now()
-      };
+      }
+    };
 
-      await AsyncStorage.setItem(READING_STATE_KEY, JSON.stringify(data));
-    } catch {
-      // Bỏ qua lỗi lưu trạng thái để app không crash.
-    }
+    readingStatesRef.current = nextStates;
+    setReadingStates(nextStates);
+    setLastReadingFolderId(storyFolderId);
+
+    await persistReadingStates(nextStates, storyFolderId);
   }
 
   async function initApp() {
     try {
-      const raw = await AsyncStorage.getItem(READING_STATE_KEY);
+      const savedData = await loadReadingStates();
 
-      if (!raw) {
+      readingStatesRef.current = savedData.states;
+      setReadingStates(savedData.states);
+      setLastReadingFolderId(savedData.lastFolderId);
+
+      if (!savedData.lastFolderId || !savedData.states[savedData.lastFolderId]) {
         await loadFolder(currentFolder);
         return;
       }
 
-      const saved = JSON.parse(raw);
-
-      if (!saved?.folderStack?.length || !saved?.chapterId) {
-        await loadFolder(currentFolder);
-        return;
-      }
-
-      const savedStack = saved.folderStack;
+      const saved = savedData.states[savedData.lastFolderId];
+      const savedStack = saved.folderStack || [];
       const lastFolder = savedStack[savedStack.length - 1];
+
+      if (!lastFolder?.id) {
+        await loadFolder(currentFolder);
+        return;
+      }
 
       setFolderStack(savedStack);
 
@@ -168,18 +259,27 @@ export default function App() {
         (item) => item.id === saved.chapterId
       );
 
-      if (!savedChapter) {
-        setMode("chapters");
-        setFolders([]);
-        setChapters(folderData.chapters);
-        return;
-      }
+      const savedIndex = folderData.chapters.findIndex(
+        (item) => item.id === saved.chapterId
+      );
+
+      setChapterListInitialIndex(
+        getChapterListStartByChapterIndex(savedIndex, folderData.chapters)
+      );
 
       setMode("chapters");
       setFolders([]);
       setChapters(folderData.chapters);
 
-      await openChapter(savedChapter, saved.scrollY || 0, folderData.chapters, savedStack);
+      if (!savedChapter) return;
+
+      await openChapter(
+        savedChapter,
+        saved.scrollY || 0,
+        folderData.chapters,
+        savedStack,
+        lastFolder.id
+      );
     } catch {
       await loadFolder(currentFolder);
     }
@@ -244,11 +344,14 @@ export default function App() {
   async function loadFolder(folder, returnDataOnly = false) {
     try {
       setErrorText("");
-      setSelectedChapter(null);
-      setChapterContent("");
       setTocVisible(false);
-      setTocGroupIndex(0);
+      setTocStartIndex(0);
       setNextPrompt(false);
+
+      if (!returnDataOnly) {
+        setSelectedChapter(null);
+        setChapterContent("");
+      }
 
       const cached = folderCacheRef.current[folder.id];
 
@@ -334,7 +437,24 @@ export default function App() {
     ];
 
     setFolderStack(nextStack);
-    await loadFolder(folder);
+
+    const data = await loadFolder(folder);
+
+    if (data?.mode === "chapters") {
+      const saved = readingStatesRef.current[folder.id];
+
+      if (saved?.chapterId) {
+        const index = data.chapters.findIndex(
+          (item) => item.id === saved.chapterId
+        );
+
+        setChapterListInitialIndex(
+          getChapterListStartByChapterIndex(index, data.chapters)
+        );
+      } else {
+        setChapterListInitialIndex(0);
+      }
+    }
   }
 
   async function fetchChapterContent(chapter) {
@@ -377,7 +497,8 @@ export default function App() {
     chapter,
     restoreScrollY = 0,
     chapterList = chapters,
-    folderStackOverride = folderStack
+    folderStackOverride = folderStack,
+    folderIdOverride = currentFolder?.id
   ) {
     try {
       changingChapterRef.current = true;
@@ -402,7 +523,10 @@ export default function App() {
       const index = chapterList.findIndex((item) => item.id === chapter.id);
 
       if (index >= 0) {
-        setTocGroupIndex(Math.floor(index / CHAPTER_GROUP_SIZE));
+        setTocStartIndex(getTocStartByChapterIndex(index, chapterList));
+        setChapterListInitialIndex(
+          getChapterListStartByChapterIndex(index, chapterList)
+        );
         prefetchNextChapter(index, chapterList);
       }
 
@@ -414,7 +538,13 @@ export default function App() {
 
         lastScrollYRef.current = restoreScrollY || 0;
         changingChapterRef.current = false;
-        saveReadingState(restoreScrollY || 0, chapter, folderStackOverride);
+
+        saveReadingState(
+          restoreScrollY || 0,
+          chapter,
+          folderStackOverride,
+          folderIdOverride
+        );
       }, 500);
     } catch (error) {
       changingChapterRef.current = false;
@@ -431,7 +561,7 @@ export default function App() {
 
     if (!nextChapter) return;
 
-    await openChapter(nextChapter, 0, chapters, folderStack);
+    await openChapter(nextChapter, 0, chapters, folderStack, currentFolder?.id);
   }
 
   function handleReaderScroll(event) {
@@ -479,18 +609,14 @@ export default function App() {
     const distanceToBottom = maxY - y;
     const nearBottom = distanceToBottom < 28;
 
-    if (!nearBottom) {
-      return;
-    }
+    if (!nearBottom) return;
 
     if (!nextPromptVisibleRef.current) {
       setNextPrompt(true);
       return;
     }
 
-    if (Date.now() < nextPromptReadyAtRef.current) {
-      return;
-    }
+    if (Date.now() < nextPromptReadyAtRef.current) return;
 
     setNextPrompt(false);
     openNextChapter();
@@ -502,10 +628,19 @@ export default function App() {
     setNextPrompt(false);
 
     if (mode === "reader") {
+      const readingChapterId = selectedChapter?.id;
+
       saveReadingState(lastScrollYRef.current);
+
+      const index = chapters.findIndex((item) => item.id === readingChapterId);
+
+      setChapterListInitialIndex(
+        getChapterListStartByChapterIndex(index, chapters)
+      );
+
       setMode("chapters");
-      setSelectedChapter(null);
       setChapterContent("");
+
       return;
     }
 
@@ -522,14 +657,18 @@ export default function App() {
     return folderStack.length > 1 || mode === "reader";
   }
 
-  function nextTocGroup() {
-    setTocGroupIndex((oldValue) =>
-      Math.min(oldValue + 1, totalTocGroups - 1)
+  function nextTocWindow() {
+    const maxStart = Math.max(chapters.length - TOC_WINDOW_SIZE, 0);
+
+    setTocStartIndex((oldValue) =>
+      Math.min(oldValue + TOC_WINDOW_SIZE - 1, maxStart)
     );
   }
 
-  function prevTocGroup() {
-    setTocGroupIndex((oldValue) => Math.max(oldValue - 1, 0));
+  function prevTocWindow() {
+    setTocStartIndex((oldValue) =>
+      Math.max(oldValue - (TOC_WINDOW_SIZE - 1), 0)
+    );
   }
 
   function toggleViewMode() {
@@ -545,6 +684,8 @@ export default function App() {
   }
 
   function renderFolderListItem({ item }) {
+    const saved = readingStates[item.id];
+
     return (
       <TouchableOpacity style={styles.folderItem} onPress={() => openFolder(item)}>
         {item.coverUrl ? (
@@ -559,12 +700,20 @@ export default function App() {
           <Text style={styles.folderName} numberOfLines={2}>
             {item.name}
           </Text>
+
+          {saved?.chapterName ? (
+            <Text style={styles.continueText} numberOfLines={1}>
+              Đang đọc: {cleanChapterName(saved.chapterName)}
+            </Text>
+          ) : null}
         </View>
       </TouchableOpacity>
     );
   }
 
   function renderFolderPosterItem({ item }) {
+    const saved = readingStates[item.id];
+
     return (
       <TouchableOpacity style={styles.posterItem} onPress={() => openFolder(item)}>
         {item.coverUrl ? (
@@ -578,12 +727,19 @@ export default function App() {
         <Text style={styles.posterName} numberOfLines={2}>
           {item.name}
         </Text>
+
+        {saved?.chapterName ? (
+          <Text style={styles.posterContinueText} numberOfLines={1}>
+            {cleanChapterName(saved.chapterName)}
+          </Text>
+        ) : null}
       </TouchableOpacity>
     );
   }
 
   function renderChapterItem({ item, index }) {
-    const isReading = selectedChapter?.id === item.id;
+    const active =
+      selectedChapter?.id === item.id || savedChapterIdForCurrentStory === item.id;
 
     return (
       <TouchableOpacity style={styles.chapterItem} onPress={() => openChapter(item)}>
@@ -591,7 +747,7 @@ export default function App() {
 
         <View style={styles.chapterInfo}>
           <Text
-            style={[styles.chapterName, isReading ? styles.chapterNameActive : null]}
+            style={[styles.chapterName, active ? styles.chapterNameActive : null]}
             numberOfLines={2}
           >
             {cleanChapterName(item.name)}
@@ -603,7 +759,8 @@ export default function App() {
 
   function renderTocChapterItem({ item }) {
     const chapterIndex = chapters.findIndex((chapter) => chapter.id === item.id);
-    const active = selectedChapter?.id === item.id;
+    const active =
+      selectedChapter?.id === item.id || savedChapterIdForCurrentStory === item.id;
 
     return (
       <TouchableOpacity
@@ -629,10 +786,7 @@ export default function App() {
             {cleanChapterName(selectedChapter?.name || "")}
           </Text>
 
-          <TouchableOpacity
-            onPress={() => setTocVisible(true)}
-            style={styles.iconButton}
-          >
+          <TouchableOpacity onPress={openToc} style={styles.iconButton}>
             <Text style={styles.iconButtonText}>☰</Text>
           </TouchableOpacity>
         </View>
@@ -682,47 +836,63 @@ export default function App() {
           <Text style={styles.loadingText}>Đang tải...</Text>
         </View>
       ) : mode === "reader" ? (
-        <ScrollView
-          ref={readerScrollRef}
-          key={selectedChapter?.id || "reader"}
-          style={styles.reader}
-          contentContainerStyle={styles.readerContent}
-          onScroll={handleReaderScroll}
-          onScrollEndDrag={handleReaderEndDrag}
-          scrollEventThrottle={80}
-        >
-          <Text
-            style={[
-              styles.storyText,
-              {
-                fontSize: storyFontSize,
-                lineHeight: Math.round(storyFontSize * 1.68)
-              }
-            ]}
-          >
-            {chapterContent}
-          </Text>
+  <View style={styles.readerWrap}>
+    <ScrollView
+      ref={readerScrollRef}
+      key={selectedChapter?.id || "reader"}
+      style={styles.reader}
+      contentContainerStyle={styles.readerContent}
+      onScroll={handleReaderScroll}
+      onScrollEndDrag={handleReaderEndDrag}
+      scrollEventThrottle={80}
+    >
+      <Text
+        style={[
+          styles.storyText,
+          {
+            fontSize: storyFontSize,
+            lineHeight: Math.round(storyFontSize * 1.68)
+          }
+        ]}
+      >
+        {chapterContent}
+      </Text>
 
-          {currentChapterIndex >= 0 && currentChapterIndex < chapters.length - 1 ? (
-            <Text style={styles.nextSwipeHint}>
-              {nextPromptVisible
-                ? "Vuốt thêm lần nữa để qua chương sau"
-                : ""}
-            </Text>
-          ) : (
-            <Text style={styles.nextSwipeHint}>Đã hết chương.</Text>
-          )}
+      {currentChapterIndex >= 0 && currentChapterIndex < chapters.length - 1 ? (
+        <Text style={styles.nextSwipeHint}>
+          {nextPromptVisible
+            ? "Vuốt thêm lần nữa để qua chương sau"
+            : ""}
+        </Text>
+      ) : (
+        <Text style={styles.nextSwipeHint}>Đã hết chương.</Text>
+      )}
+    </ScrollView>
 
-          <Text style={styles.readerProgress}>
-            {currentChapterIndex + 1}/{chapters.length}
-          </Text>
-        </ScrollView>
+    <View pointerEvents="none" style={styles.readerProgressOverlay}>
+      <Text style={styles.readerProgressText}>
+        {Math.max(currentChapterIndex + 1, 0)}/{chapters.length}
+      </Text>
+    </View>
+  </View>
       ) : mode === "chapters" ? (
         <FlatList
+          key={`chapter-list-${currentFolder?.id}-${chapterListInitialIndex}`}
           data={chapters}
+          initialScrollIndex={
+            chapters.length > 0
+              ? Math.min(chapterListInitialIndex, chapters.length - 1)
+              : 0
+          }
           keyExtractor={(item) => item.id}
           contentContainerStyle={styles.list}
           renderItem={renderChapterItem}
+          getItemLayout={(data, index) => ({
+            length: CHAPTER_ROW_HEIGHT,
+            offset: CHAPTER_ROW_HEIGHT * index,
+            index
+          })}
+          onScrollToIndexFailed={() => {}}
           ListEmptyComponent={
             <Text style={styles.emptyText}>Không có chương .txt nào.</Text>
           }
@@ -777,43 +947,47 @@ export default function App() {
 
             <View style={styles.tocPager}>
               <TouchableOpacity
-                onPress={prevTocGroup}
+                onPress={prevTocWindow}
                 style={[
                   styles.arrowButton,
-                  tocGroupIndex <= 0 ? styles.arrowDisabled : null
+                  tocStartIndex <= 0 ? styles.arrowDisabled : null
                 ]}
-                disabled={tocGroupIndex <= 0}
+                disabled={tocStartIndex <= 0}
               >
                 <Text style={styles.arrowText}>←</Text>
               </TouchableOpacity>
 
               <Text style={styles.tocGroupText}>
-                Chương {tocGroupIndex * CHAPTER_GROUP_SIZE + 1} -{" "}
-                {Math.min(
-                  (tocGroupIndex + 1) * CHAPTER_GROUP_SIZE,
-                  chapters.length
-                )}
+                Chương {tocStartIndex + 1} -{" "}
+                {Math.min(tocStartIndex + TOC_WINDOW_SIZE, chapters.length)}
               </Text>
 
               <TouchableOpacity
-                onPress={nextTocGroup}
+                onPress={nextTocWindow}
                 style={[
                   styles.arrowButton,
-                  tocGroupIndex >= totalTocGroups - 1
+                  tocStartIndex + TOC_WINDOW_SIZE >= chapters.length
                     ? styles.arrowDisabled
                     : null
                 ]}
-                disabled={tocGroupIndex >= totalTocGroups - 1}
+                disabled={tocStartIndex + TOC_WINDOW_SIZE >= chapters.length}
               >
                 <Text style={styles.arrowText}>→</Text>
               </TouchableOpacity>
             </View>
 
             <FlatList
+              key={`toc-${tocStartIndex}`}
               data={currentTocChapters}
               keyExtractor={(item) => item.id}
               renderItem={renderTocChapterItem}
               contentContainerStyle={styles.tocList}
+              getItemLayout={(data, index) => ({
+                length: TOC_ROW_HEIGHT,
+                offset: TOC_ROW_HEIGHT * index,
+                index
+              })}
+              onScrollToIndexFailed={() => {}}
             />
           </View>
         </View>
@@ -841,6 +1015,7 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     alignItems: "center"
   },
+  
   title: {
     marginTop: 0,
     fontSize: 22,
@@ -933,6 +1108,12 @@ const styles = StyleSheet.create({
     fontWeight: "800",
     color: "#2f2418"
   },
+  continueText: {
+    marginTop: 6,
+    fontSize: 12,
+    color: "#007aff",
+    fontWeight: "500"
+  },
   posterItem: {
     width: "48%",
     margin: "1%",
@@ -963,9 +1144,17 @@ const styles = StyleSheet.create({
     color: "#2f2418",
     textAlign: "center"
   },
+  posterContinueText: {
+    marginTop: 4,
+    fontSize: 10,
+    color: "#007aff",
+    textAlign: "center",
+    fontWeight: "400"
+  },
   chapterItem: {
     flexDirection: "row",
     alignItems: "center",
+    minHeight: 64,
     padding: 13,
     marginBottom: 9,
     backgroundColor: "#fffaf0",
@@ -1001,7 +1190,7 @@ const styles = StyleSheet.create({
   readerContent: {
     paddingHorizontal: 18,
     paddingTop: 10,
-    paddingBottom: 70
+    paddingBottom: 36
   },
   storyText: {
     fontSize: 19,
@@ -1017,11 +1206,12 @@ const styles = StyleSheet.create({
     color: "#8b7355"
   },
   readerProgress: {
-    marginTop: 8,
+    marginTop: 4,
+    marginBottom: 4,
     textAlign: "center",
-    fontSize: 9,
+    fontSize: 8,
     fontWeight: "400",
-    color: "#8b7355"
+    color: "#9a8871"
   },
   center: {
     flex: 1,
@@ -1129,6 +1319,7 @@ const styles = StyleSheet.create({
     paddingBottom: 30
   },
   tocItem: {
+    minHeight: 48,
     padding: 9,
     marginBottom: 6,
     borderRadius: 10,
