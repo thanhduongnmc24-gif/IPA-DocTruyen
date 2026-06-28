@@ -465,11 +465,36 @@ export default function App() {
     }
 
     const url = getFileMediaUrl(chapter.id);
-    const res = await fetch(url);
+
+    const res = await fetch(url, {
+      headers: {
+        Accept: "text/plain,*/*"
+      }
+    });
+
+    const contentType = res.headers.get("content-type") || "";
     const text = await res.text();
 
     if (!res.ok) {
+      if (text.includes("automated queries") || text.includes("We're sorry")) {
+        throw new Error(
+          "Google đang chặn request vì nghi truy vấn tự động. Thử tắt app mở lại, đổi mạng, hoặc giảm tải/prefetch."
+        );
+      }
+
+      if (contentType.includes("text/html")) {
+        throw new Error(
+          "Google trả về HTML thay vì nội dung truyện. Kiểm tra file .txt có public không, API key, hoặc URL bị sai."
+        );
+      }
+
       throw new Error(text || "Không đọc được chương truyện");
+    }
+
+    if (contentType.includes("text/html")) {
+      throw new Error(
+        "File trả về HTML, không phải text. Có thể file không phải .txt thật hoặc Drive đang chặn tải."
+      );
     }
 
     chapterContentCacheRef.current[chapter.id] = text;
@@ -527,7 +552,6 @@ export default function App() {
         setChapterListInitialIndex(
           getChapterListStartByChapterIndex(index, chapterList)
         );
-        prefetchNextChapter(index, chapterList);
       }
 
       setTimeout(() => {
@@ -578,6 +602,13 @@ export default function App() {
     const distanceToBottom = maxY - y;
 
     lastScrollYRef.current = y;
+
+    // Logic gọi prefetch khi cuộn được 4/5 (80%) nội dung hoặc khi nội dung ngắn không cần cuộn
+    if (maxY === 0 || (y / maxY) >= 0.8) {
+      if (currentChapterIndex >= 0) {
+        prefetchNextChapter(currentChapterIndex, chapters);
+      }
+    }
 
     const now = Date.now();
 
@@ -782,9 +813,14 @@ export default function App() {
             <Text style={styles.iconButtonText}>←</Text>
           </TouchableOpacity>
 
-          <Text style={styles.readerTitle} numberOfLines={1}>
-            {cleanChapterName(selectedChapter?.name || "")}
-          </Text>
+          <View style={styles.readerTitleContainer}>
+            <Text style={styles.readerTitle} numberOfLines={1}>
+              {cleanChapterName(selectedChapter?.name || "")}
+            </Text>
+            <Text style={styles.readerProgressTop}>
+              {Math.max(currentChapterIndex + 1, 0)}/{chapters.length}
+            </Text>
+          </View>
 
           <TouchableOpacity onPress={openToc} style={styles.iconButton}>
             <Text style={styles.iconButtonText}>☰</Text>
@@ -836,45 +872,39 @@ export default function App() {
           <Text style={styles.loadingText}>Đang tải...</Text>
         </View>
       ) : mode === "reader" ? (
-  <View style={styles.readerWrap}>
-    <ScrollView
-      ref={readerScrollRef}
-      key={selectedChapter?.id || "reader"}
-      style={styles.reader}
-      contentContainerStyle={styles.readerContent}
-      onScroll={handleReaderScroll}
-      onScrollEndDrag={handleReaderEndDrag}
-      scrollEventThrottle={80}
-    >
-      <Text
-        style={[
-          styles.storyText,
-          {
-            fontSize: storyFontSize,
-            lineHeight: Math.round(storyFontSize * 1.68)
-          }
-        ]}
-      >
-        {chapterContent}
-      </Text>
+        <View style={styles.readerWrap}>
+          <ScrollView
+            ref={readerScrollRef}
+            key={selectedChapter?.id || "reader"}
+            style={styles.reader}
+            contentContainerStyle={styles.readerContent}
+            onScroll={handleReaderScroll}
+            onScrollEndDrag={handleReaderEndDrag}
+            scrollEventThrottle={80}
+          >
+            <Text
+              style={[
+                styles.storyText,
+                {
+                  fontSize: storyFontSize,
+                  lineHeight: Math.round(storyFontSize * 1.68)
+                }
+              ]}
+            >
+              {chapterContent}
+            </Text>
 
-      {currentChapterIndex >= 0 && currentChapterIndex < chapters.length - 1 ? (
-        <Text style={styles.nextSwipeHint}>
-          {nextPromptVisible
-            ? "Vuốt thêm lần nữa để qua chương sau"
-            : ""}
-        </Text>
-      ) : (
-        <Text style={styles.nextSwipeHint}>Đã hết chương.</Text>
-      )}
-    </ScrollView>
-
-    <View pointerEvents="none" style={styles.readerProgressOverlay}>
-      <Text style={styles.readerProgressText}>
-        {Math.max(currentChapterIndex + 1, 0)}/{chapters.length}
-      </Text>
-    </View>
-  </View>
+            {currentChapterIndex >= 0 && currentChapterIndex < chapters.length - 1 ? (
+              <Text style={styles.nextSwipeHint}>
+                {nextPromptVisible
+                  ? "Vuốt thêm lần nữa để qua chương sau"
+                  : ""}
+              </Text>
+            ) : (
+              <Text style={styles.nextSwipeHint}>Đã hết chương.</Text>
+            )}
+          </ScrollView>
+        </View>
       ) : mode === "chapters" ? (
         <FlatList
           key={`chapter-list-${currentFolder?.id}-${chapterListInitialIndex}`}
@@ -1031,13 +1061,24 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center"
   },
-  readerTitle: {
+  readerTitleContainer: {
     flex: 1,
     marginHorizontal: 8,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  readerTitle: {
     fontSize: 7,
     fontWeight: "700",
     color: "#007aff",
     textAlign: "center"
+  },
+  readerProgressTop: {
+    fontSize: 6,
+    fontWeight: "500",
+    color: "#8b7355",
+    textAlign: "center",
+    marginTop: 2
   },
   iconButton: {
     width: 30,
@@ -1154,13 +1195,23 @@ const styles = StyleSheet.create({
   chapterItem: {
     flexDirection: "row",
     alignItems: "center",
-    minHeight: 64,
-    padding: 13,
+    height: 64, // Giữ nguyên chiều cao cố định để không bị trượt list
+    paddingHorizontal: 13,
+    paddingVertical: 10, // Ép mỏng đệm trên/dưới lại để nhường chỗ cho chữ
     marginBottom: 9,
     backgroundColor: "#fffaf0",
     borderRadius: 14,
     borderWidth: 1,
     borderColor: "#eadfca"
+  },
+  
+  // (Giữ nguyên các style khác ở giữa)
+
+  chapterName: {
+    fontSize: 12, // Giảm cỡ chữ xuống 14 cho thon gọn
+    lineHeight: 20, // Ép cứng khoảng cách dòng để 2 dòng vừa khít 40px
+    fontWeight: "700",
+    color: "#2f2418"
   },
   chapterIndex: {
     width: 34,
@@ -1184,6 +1235,9 @@ const styles = StyleSheet.create({
   chapterNameActive: {
     color: "#007aff"
   },
+  readerWrap: {
+    flex: 1
+  },
   reader: {
     flex: 1
   },
@@ -1204,14 +1258,6 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "400",
     color: "#8b7355"
-  },
-  readerProgress: {
-    marginTop: 4,
-    marginBottom: 4,
-    textAlign: "center",
-    fontSize: 8,
-    fontWeight: "400",
-    color: "#9a8871"
   },
   center: {
     flex: 1,
