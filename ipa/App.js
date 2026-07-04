@@ -1038,7 +1038,7 @@ const styles = StyleSheet.create({
     borderBottomColor: "#eadfca"
   },
   headerTop: {
-    minHeight: 34,
+    minHeight: 20,
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center"
@@ -1046,7 +1046,7 @@ const styles = StyleSheet.create({
   
   title: {
     marginTop: 0,
-    fontSize: 22,
+    fontSize: 16,
     fontWeight: "900",
     color: "#3b2f20"
   },
