@@ -104,10 +104,9 @@ export default function App() {
       name.endsWith(".bmp")
     );
   }
-
-  function cleanChapterName(name) {
-    return (name || "").replace(/\.txt$/i, "");
-  }
+function cleanChapterName(name) {
+  return (name || "").replace(/\.txt$/i, "");
+}
 
   function getFileMediaUrl(fileId) {
     return `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media&key=${API_KEY}`;
@@ -768,25 +767,24 @@ export default function App() {
     );
   }
 
-  function renderChapterItem({ item, index }) {
-    const active =
-      selectedChapter?.id === item.id || savedChapterIdForCurrentStory === item.id;
+function renderChapterItem({ item }) {
+  const active =
+    selectedChapter?.id === item.id || savedChapterIdForCurrentStory === item.id;
 
-    return (
-      <TouchableOpacity style={styles.chapterItem} onPress={() => openChapter(item)}>
-        <Text style={styles.chapterIndex}>{index + 1}</Text>
+  return (
+    <TouchableOpacity style={styles.chapterItem} onPress={() => openChapter(item)}>
+      <View style={styles.chapterInfoFull}>
+        <Text
+          style={[styles.chapterName, active ? styles.chapterNameActive : null]}
+          numberOfLines={2}
+        >
+          {cleanChapterName(item.name)}
+        </Text>
+      </View>
+    </TouchableOpacity>
+  );
+}
 
-        <View style={styles.chapterInfo}>
-          <Text
-            style={[styles.chapterName, active ? styles.chapterNameActive : null]}
-            numberOfLines={2}
-          >
-            {cleanChapterName(item.name)}
-          </Text>
-        </View>
-      </TouchableOpacity>
-    );
-  }
 
   function renderTocChapterItem({ item }) {
     const chapterIndex = chapters.findIndex((chapter) => chapter.id === item.id);
@@ -1192,49 +1190,47 @@ const styles = StyleSheet.create({
     textAlign: "center",
     fontWeight: "400"
   },
-  chapterItem: {
-    flexDirection: "row",
-    alignItems: "center",
-    height: 64, // Giữ nguyên chiều cao cố định để không bị trượt list
-    paddingHorizontal: 13,
-    paddingVertical: 10, // Ép mỏng đệm trên/dưới lại để nhường chỗ cho chữ
-    marginBottom: 9,
-    backgroundColor: "#fffaf0",
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: "#eadfca"
-  },
   
-  // (Giữ nguyên các style khác ở giữa)
 
-  chapterName: {
-    fontSize: 12, // Giảm cỡ chữ xuống 14 cho thon gọn
-    lineHeight: 20, // Ép cứng khoảng cách dòng để 2 dòng vừa khít 40px
-    fontWeight: "700",
-    color: "#2f2418"
-  },
-  chapterIndex: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    textAlign: "center",
-    lineHeight: 34,
-    backgroundColor: "#8b5e34",
-    color: "#fff",
-    fontWeight: "900"
-  },
-  chapterInfo: {
-    flex: 1,
-    marginLeft: 12
-  },
-  chapterName: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: "#2f2418"
-  },
-  chapterNameActive: {
-    color: "#007aff"
-  },
+chapterItem: {
+  flexDirection: "row",
+  alignItems: "flex-start",
+  minHeight: 54,
+  padding: 12,
+  marginBottom: 8,
+  backgroundColor: "#fffaf0",
+  borderRadius: 14,
+  borderWidth: 1,
+  borderColor: "#eadfca"
+},
+
+
+
+  chapterItem: {
+  height: 64,
+  flexDirection: "row",
+  alignItems: "center",
+  paddingHorizontal: 13,
+  marginBottom: 9,
+  backgroundColor: "#fffaf0",
+  borderRadius: 14,
+  borderWidth: 1,
+  borderColor: "#eadfca"
+},
+chapterInfoFull: {
+  flex: 1,
+  width: "100%"
+},
+chapterName: {
+  flexShrink: 1,
+  fontSize: 13,
+  lineHeight: 18,
+  fontWeight: "500",
+  color: "#2f2418"
+},
+chapterNameActive: {
+  color: "#007aff"
+},
   readerWrap: {
     flex: 1
   },
