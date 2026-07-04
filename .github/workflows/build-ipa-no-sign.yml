@@ -1,6 +1,13 @@
 name: Build Unsigned IPA to Releases
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - "ipa/**"
+      - ".github/workflows/build-ipa-no-sign.yml"
+
   workflow_dispatch:
 
 permissions:
@@ -99,7 +106,7 @@ jobs:
           mkdir -p build/Payload
           mv build/MyApp.xcarchive/Products/Applications/*.app build/Payload/
           cd build
-          zip -r -9 TruyenTep.ipa Payload
+          zip -r -9 Doc-truyen.ipa Payload
 
       - name: Generate Tag Name
         id: tag
@@ -112,6 +119,6 @@ jobs:
           tag_name: ${{ steps.tag.outputs.release_tag }}
           name: Bản Build ${{ steps.tag.outputs.release_tag }}
           body: "Bản build không chứng chỉ Unsigned. Dùng ESign/Scarlet để ký trước khi cài."
-          files: ipa/build/TruyenTep.ipa
+          files: ipa/build/Doc-truyen.ipa
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

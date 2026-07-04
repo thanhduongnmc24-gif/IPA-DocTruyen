@@ -1,4 +1,5 @@
 git add ipa/App.js ipa/package.json ipa/package-lock.json .gitignore
 git commit -m "Update app"
 git push origin main
-git add . && git commit -m "Cập nhật" && git push origin main
+git add . && git commit -m "fixx" && git push origin main
+npx expo start --tunnel
