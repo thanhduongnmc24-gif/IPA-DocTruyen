@@ -24,7 +24,7 @@ struct SettingsSheetView: View {
                         }
 
                         if showApiKeyPlain {
-                            TextField("Nhập khóa AIzaSy...", text: $viewModel.geminiApiKey)
+                            TextField("Dán mã AIzaSy...", text: $viewModel.geminiApiKey)
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
                                 .font(.system(.subheadline, design: .monospaced))
@@ -32,7 +32,7 @@ struct SettingsSheetView: View {
                                 .background(Color(.secondarySystemBackground))
                                 .clipShape(RoundedRectangle(cornerRadius: 10))
                         } else {
-                            SecureField("Nhập khóa AIzaSy...", text: $viewModel.geminiApiKey)
+                            SecureField("Dán mã AIzaSy...", text: $viewModel.geminiApiKey)
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
                                 .font(.system(.subheadline, design: .monospaced))
@@ -41,13 +41,13 @@ struct SettingsSheetView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 10))
                         }
 
-                        Text("Khóa API được lưu an toàn ngay trên máy của bạn để dịch và biên tập lại chương truyện.")
+                        Text("Bạn chỉ cần nhập duy nhất Gemini API Key tại đây để dịch truyện. Lấy miễn phí tại aistudio.google.com.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     .padding(.vertical, 4)
                 } header: {
-                    Text("Kết nối Gemini AI")
+                    Text("Kết nối Gemini AI (Bắt buộc khi dịch)")
                 }
 
                 Section {
@@ -62,7 +62,7 @@ struct SettingsSheetView: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Tự động chuyển sang 3.1 Flash Lite khi hết Quota")
                                 .font(.subheadline.weight(.medium))
-                            Text("Nếu 3.5 Flash Lite hết hạn mức, ứng dụng sẽ tự động gọi 3.1 Flash Lite để không làm gián đoạn quá trình dịch.")
+                            Text("Nếu 3.5 Flash Lite hết hạn mức, ứng dụng sẽ tự động gọi 3.1 Flash Lite để không bị ngắt quãng.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -88,13 +88,13 @@ struct SettingsSheetView: View {
                         }
 
                         TextEditor(text: $viewModel.translationPrompt)
-                            .frame(minHeight: 165)
+                            .frame(minHeight: 160)
                             .font(.system(size: 14))
                             .padding(6)
                             .background(Color(.secondarySystemBackground))
                             .clipShape(RoundedRectangle(cornerRadius: 10))
 
-                        Text("Câu lệnh này giúp AI sắp xếp lại câu từ tiếng Trung convert sang văn phong tiểu thuyết tiếng Việt mượt mà, dễ đọc.")
+                        Text("Câu lệnh này đã được thiết lập sẵn để sắp xếp lại câu từ tiếng Trung convert sang văn phong tiểu thuyết mượt mà, dễ đọc.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -124,36 +124,93 @@ struct SettingsSheetView: View {
                 }
 
                 Section {
-                    DisclosureGroup("Cấu hình Google Drive nâng cao (Tùy chọn)", isExpanded: $showDriveAdvanced) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Mặc định ứng dụng dùng khóa Google Drive tích hợp khi build. Bạn chỉ cần điền nếu muốn đổi sang kho truyện khác.")
+                    HStack(spacing: 10) {
+                        Image(systemName: viewModel.isDriveConfiguredViaSecrets ? "checkmark.seal.fill" : "info.circle.fill")
+                            .foregroundStyle(viewModel.isDriveConfiguredViaSecrets ? .green : .orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(viewModel.isDriveConfiguredViaSecrets
+                                 ? "Đã kết nối sẵn Google Drive từ GitHub Secrets"
+                                 : "Chưa có khóa Google Drive mặc định")
+                                .font(.subheadline.weight(.semibold))
+                            Text(viewModel.isDriveConfiguredViaSecrets
+                                 ? "Bạn KHÔNG cần nhập mục bên dưới trừ khi muốn đổi sang thư mục Google Drive khác."
+                                 : "Hãy nhập Google Drive API Key và Link thư mục Google Drive bên dưới.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-
-                            TextField("Google Drive API Key tùy chỉnh", text: $viewModel.driveApiKeyOverride)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                                .font(.caption)
-
-                            TextField("Root Folder ID tùy chỉnh", text: $viewModel.driveFolderIdOverride)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                                .font(.caption)
-
-                            TextField("Drive OAuth Access Token (để ghi đè cả trên đám mây)", text: $viewModel.driveAccessToken)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                                .font(.caption)
                         }
-                        .padding(.vertical, 4)
+                    }
+                    .padding(.vertical, 4)
+
+                    DisclosureGroup("Đổi thư mục Google Drive khác (Không bắt buộc)", isExpanded: $showDriveAdvanced) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("1. Link thư mục hoặc Folder ID:")
+                                    .font(.caption.weight(.semibold))
+                                TextField("Dán nguyên link drive.google.com/drive/folders/... hoặc ID", text: $viewModel.driveFolderIdOverride)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                                    .font(.caption)
+                                    .padding(9)
+                                    .background(Color(.secondarySystemBackground))
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                                Text("Mẹo: Bạn có thể copy nguyên đường link thư mục Google Drive rồi dán vào đây, ứng dụng sẽ tự động tách lấy mã ID.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("2. Google Drive API Key (Để trống nếu dùng mặc định):")
+                                    .font(.caption.weight(.semibold))
+                                TextField("AIzaSy... (Bỏ trống để dùng key có sẵn trong app)", text: $viewModel.driveApiKeyOverride)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                                    .font(.caption)
+                                    .padding(9)
+                                    .background(Color(.secondarySystemBackground))
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                            }
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("3. OAuth Access Token (Bỏ trống - chỉ dùng nếu muốn ghi đè lên đám mây):")
+                                    .font(.caption.weight(.semibold))
+                                TextField("ya29... (Không bắt buộc, mặc định app đã ghi đè file trong máy)", text: $viewModel.driveAccessToken)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                                    .font(.caption)
+                                    .padding(9)
+                                    .background(Color(.secondarySystemBackground))
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                            }
+
+                            Button {
+                                Task {
+                                    await viewModel.applyCustomDriveSettingsAndReload()
+                                }
+                            } label: {
+                                Label("Áp dụng & Tải lại thư viện Drive", systemImage: "arrow.clockwise.circle.fill")
+                                    .font(.caption.weight(.bold))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                        .padding(.vertical, 6)
                     }
                 } header: {
-                    Text("Nguồn dữ liệu")
+                    Text("Nguồn dữ liệu Google Drive")
                 }
             }
+            .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Cài đặt AI & Giao diện")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Ẩn bàn phím") {
+                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                    }
+                    .fontWeight(.semibold)
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Xong") {
                         dismiss()

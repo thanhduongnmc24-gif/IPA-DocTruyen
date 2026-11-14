@@ -98,18 +98,38 @@ final class AppViewModel: ObservableObject {
 
     let tocWindowSize = 50
 
+    var bundledDriveApiKey: String {
+        let raw = (Bundle.main.object(forInfoDictionaryKey: "GoogleDriveAPIKey") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if raw.isEmpty || raw == "__GOOGLE_DRIVE_API_KEY__" || raw.hasPrefix("$(") {
+            return ""
+        }
+        return raw
+    }
+
+    var bundledRootFolderId: String {
+        let raw = (Bundle.main.object(forInfoDictionaryKey: "GoogleDriveFolderID") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if raw.isEmpty || raw == "__GOOGLE_DRIVE_FOLDER_ID__" || raw.hasPrefix("$(") {
+            return ""
+        }
+        return DriveInputParser.extractFolderId(from: raw)
+    }
+
+    var isDriveConfiguredViaSecrets: Bool {
+        !bundledDriveApiKey.isEmpty && !bundledRootFolderId.isEmpty
+    }
+
     var activeDriveApiKey: String {
         let override = driveApiKeyOverride.trimmingCharacters(in: .whitespacesAndNewlines)
         if !override.isEmpty { return override }
-        return (Bundle.main.object(forInfoDictionaryKey: "GoogleDriveAPIKey") as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return bundledDriveApiKey
     }
 
     var activeRootFolderId: String {
-        let override = driveFolderIdOverride.trimmingCharacters(in: .whitespacesAndNewlines)
+        let override = DriveInputParser.extractFolderId(from: driveFolderIdOverride)
         if !override.isEmpty { return override }
-        return (Bundle.main.object(forInfoDictionaryKey: "GoogleDriveFolderID") as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return bundledRootFolderId
     }
 
     var currentFolder: FolderNode {
@@ -191,6 +211,14 @@ final class AppViewModel: ObservableObject {
     func resetPromptToDefault() {
         translationPrompt = DefaultPrompts.standardNovelPolish
         showToast("Đã khôi phục câu lệnh dịch mặc định")
+    }
+
+    func applyCustomDriveSettingsAndReload() async {
+        folderCache.removeAll()
+        let rootNode = FolderNode(id: activeRootFolderId, name: "Thư viện truyện")
+        folderStack = [rootNode]
+        _ = await loadFolder(rootNode)
+        showToast("Đã cập nhật kết nối Google Drive")
     }
 
     func showToast(_ message: String) {
@@ -393,7 +421,6 @@ final class AppViewModel: ObservableObject {
         )
 
         chapterContentCache[chapter.id] = downloaded
-        // Lưu bản gốc vào file cục bộ để sẵn sàng đọc offline và ghi đè khi dịch
         if !LocalChapterStorage.shared.isChapterTranslated(chapter.id) {
             try? LocalChapterStorage.shared.overwriteChapterFile(
                 chapterId: chapter.id,
@@ -525,7 +552,6 @@ final class AppViewModel: ObservableObject {
                 translationStatusNote = "Đang dịch (\(offset + 1)/\(targetSlice.count)): \(chapter.cleanChapterName)..."
 
                 do {
-                    // Luôn lấy nội dung hiện có của chương để dịch lại
                     let sourceText = try await fetchChapterText(chapter)
 
                     let outcome = try await GeminiService.shared.translateChapterContent(
