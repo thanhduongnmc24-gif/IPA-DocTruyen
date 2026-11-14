@@ -4,17 +4,29 @@ struct TranslationRangeSheetView: View {
     @ObservedObject var viewModel: AppViewModel
     @Environment(\.dismiss) private var dismiss
     @State private var showPromptEditor: Bool = false
+    @State private var activeChapterPickerTarget: ChapterPickerTarget?
 
-    private var selectedSpanCount: Int {
-        abs(viewModel.translateToChapterIndex - viewModel.translateFromChapterIndex) + 1
+    enum ChapterPickerTarget: String, Identifiable {
+        case fromChapter = "from"
+        case toChapter = "to"
+        var id: String { rawValue }
     }
 
     var body: some View {
+        let _ = viewModel.translatedRevisionTrigger
+        let startIdx = max(0, min(viewModel.translateFromChapterIndex, viewModel.translateToChapterIndex))
+        let endIdx = min(max(viewModel.chapters.count - 1, 0), max(viewModel.translateFromChapterIndex, viewModel.translateToChapterIndex))
+        let selectedChaptersSlice = viewModel.chapters.isEmpty ? [] : Array(viewModel.chapters[startIdx...endIdx])
+        let alreadyTranslatedCount = selectedChaptersSlice.filter {
+            LocalChapterStorage.shared.isChapterTranslated($0.id)
+        }.count
+        let untranslatedCount = max(0, selectedChaptersSlice.count - alreadyTranslatedCount)
+
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    // Header Card
-                    HStack(spacing: 14) {
+                VStack(alignment: .leading, spacing: 16) {
+                    // Header Card gọn gàng
+                    HStack(spacing: 12) {
                         ZStack {
                             Circle()
                                 .fill(LinearGradient(
@@ -22,78 +34,108 @@ struct TranslationRangeSheetView: View {
                                     startPoint: .topLeading,
                                     endPoint: .bottomTrailing
                                 ))
-                                .frame(width: 46, height: 46)
+                                .frame(width: 42, height: 42)
                             Image(systemName: "sparkles")
-                                .font(.title3.weight(.bold))
+                                .font(.headline.weight(.bold))
                                 .foregroundStyle(.white)
                         }
-                        .fixedSize()
 
-                        VStack(alignment: .leading, spacing: 4) {
+                        VStack(alignment: .leading, spacing: 3) {
                             Text("Dịch & Biên tập lại truyện")
-                                .font(.headline)
-                            Text("Thay thế nội dung convert khó đọc và ghi đè trực tiếp vào file chương.")
+                                .font(.subheadline.weight(.bold))
+                            Text("Chương đã dịch có dấu ✅ Đã dịch rõ ràng để bạn dễ chọn.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    .padding(14)
+                    .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(Color(.secondarySystemBackground))
-                    .clipShape(RoundedRectangle(cornerRadius: 16))
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
 
                     // Range Picker Section
-                    VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 10) {
                         Text("Chọn phạm vi chương cần dịch")
                             .font(.subheadline.weight(.bold))
 
-                        // 3 nút chọn nhanh luôn nằm gọn trên 1 dòng, bằng nhau
-                        HStack(spacing: 8) {
-                            quickRangeButton(title: "Chỉ chương này", span: 1) {
-                                let idx = max(0, viewModel.currentChapterIndex)
-                                viewModel.translateFromChapterIndex = idx
-                                viewModel.translateToChapterIndex = idx
-                            }
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                quickRangeButton("Chỉ chương này") {
+                                    let idx = max(0, viewModel.currentChapterIndex)
+                                    viewModel.translateFromChapterIndex = idx
+                                    viewModel.translateToChapterIndex = idx
+                                }
 
-                            quickRangeButton(title: "5 chương tiếp", span: 5) {
-                                let idx = max(0, viewModel.currentChapterIndex)
-                                viewModel.translateFromChapterIndex = idx
-                                viewModel.translateToChapterIndex = min(max(viewModel.chapters.count - 1, 0), idx + 4)
-                            }
+                                quickRangeButton("5 chương tiếp") {
+                                    let idx = max(0, viewModel.currentChapterIndex)
+                                    viewModel.translateFromChapterIndex = idx
+                                    viewModel.translateToChapterIndex = min(viewModel.chapters.count - 1, idx + 4)
+                                }
 
-                            quickRangeButton(title: "10 chương tiếp", span: 10) {
-                                let idx = max(0, viewModel.currentChapterIndex)
-                                viewModel.translateFromChapterIndex = idx
-                                viewModel.translateToChapterIndex = min(max(viewModel.chapters.count - 1, 0), idx + 9)
+                                quickRangeButton("10 chương tiếp") {
+                                    let idx = max(0, viewModel.currentChapterIndex)
+                                    viewModel.translateFromChapterIndex = idx
+                                    viewModel.translateToChapterIndex = min(viewModel.chapters.count - 1, idx + 9)
+                                }
+
+                                quickRangeButton("Tìm 5 chương chưa dịch") {
+                                    selectNextUntranslatedRange(count: 5)
+                                }
                             }
                         }
 
                         if !viewModel.chapters.isEmpty {
-                            VStack(spacing: 12) {
+                            VStack(spacing: 0) {
                                 chapterSelectorRow(
-                                    label: "Từ chương:",
-                                    selectedIndex: $viewModel.translateFromChapterIndex
-                                )
+                                    label: "Từ chương",
+                                    selectedIndex: viewModel.translateFromChapterIndex
+                                ) {
+                                    activeChapterPickerTarget = .fromChapter
+                                }
 
                                 Divider()
+                                    .padding(.leading, 12)
 
                                 chapterSelectorRow(
-                                    label: "Đến chương:",
-                                    selectedIndex: $viewModel.translateToChapterIndex
-                                )
+                                    label: "Đến chương",
+                                    selectedIndex: viewModel.translateToChapterIndex
+                                ) {
+                                    activeChapterPickerTarget = .toChapter
+                                }
                             }
-                            .padding(12)
                             .background(Color(.secondarySystemBackground))
                             .clipShape(RoundedRectangle(cornerRadius: 14))
                         }
 
-                        Text("Tổng cộng: **\(selectedSpanCount) chương** sẽ được biên tập lại và ghi đè file gốc.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        // Thống kê rõ ràng bao nhiêu chương đã dịch / chưa dịch trong khoảng đang chọn
+                        HStack(spacing: 10) {
+                            Label("Tổng: \(selectedChaptersSlice.count) chương", systemImage: "books.vertical.fill")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.primary)
+
+                            Spacer()
+
+                            Text("✅ Đã dịch: \(alreadyTranslatedCount)")
+                                .font(.caption2.weight(.bold))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.green.opacity(0.16))
+                                .foregroundStyle(Color.green)
+                                .clipShape(Capsule())
+
+                            Text("⏳ Chưa dịch: \(untranslatedCount)")
+                                .font(.caption2.weight(.bold))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                                .background(Color.orange.opacity(0.16))
+                                .foregroundStyle(Color.orange)
+                                .clipShape(Capsule())
+                        }
+                        .padding(.top, 2)
                     }
 
                     // Model & API Key Quick Config
-                    VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 10) {
                         Text("Model AI & Khóa kết nối")
                             .font(.subheadline.weight(.bold))
 
@@ -129,7 +171,7 @@ struct TranslationRangeSheetView: View {
                     DisclosureGroup("Xem / Chỉnh sửa câu lệnh dịch (Prompt)", isExpanded: $showPromptEditor) {
                         VStack(alignment: .leading, spacing: 8) {
                             TextEditor(text: $viewModel.translationPrompt)
-                                .frame(minHeight: 130)
+                                .frame(minHeight: 120)
                                 .font(.caption)
                                 .padding(6)
                                 .background(Color(.systemBackground))
@@ -196,7 +238,7 @@ struct TranslationRangeSheetView: View {
                             } label: {
                                 HStack(spacing: 8) {
                                     Image(systemName: "wand.and.stars")
-                                    Text("Bắt đầu Dịch & Ghi đè File")
+                                    Text("Bắt đầu Dịch & Ghi đè File (\(selectedChaptersSlice.count) chương)")
                                         .fontWeight(.bold)
                                 }
                                 .frame(maxWidth: .infinity)
@@ -229,7 +271,7 @@ struct TranslationRangeSheetView: View {
                         }
                     }
                 }
-                .padding(18)
+                .padding(16)
             }
             .navigationTitle("Dịch Truyện AI")
             .navigationBarTitleDisplayMode(.inline)
@@ -240,152 +282,225 @@ struct TranslationRangeSheetView: View {
                     }
                 }
             }
+            .sheet(item: $activeChapterPickerTarget) { target in
+                ChapterSelectionListModal(
+                    title: target == .fromChapter ? "Chọn chương bắt đầu dịch" : "Chọn chương kết thúc dịch",
+                    chapters: viewModel.chapters,
+                    selectedIndex: target == .fromChapter ? viewModel.translateFromChapterIndex : viewModel.translateToChapterIndex
+                ) { chosenIdx in
+                    if target == .fromChapter {
+                        viewModel.translateFromChapterIndex = chosenIdx
+                        if viewModel.translateToChapterIndex < chosenIdx {
+                            viewModel.translateToChapterIndex = chosenIdx
+                        }
+                    } else {
+                        viewModel.translateToChapterIndex = chosenIdx
+                        if viewModel.translateFromChapterIndex > chosenIdx {
+                            viewModel.translateFromChapterIndex = chosenIdx
+                        }
+                    }
+                }
+            }
         }
     }
 
-    @ViewBuilder
-    private func quickRangeButton(title: String, span: Int, action: @escaping () -> Void) -> some View {
-        let isSelected = (viewModel.translateFromChapterIndex == max(0, viewModel.currentChapterIndex)) && (selectedSpanCount == span)
-
+    private func quickRangeButton(_ title: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.caption.weight(.bold))
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 10)
-                .padding(.horizontal, 6)
-                .background(isSelected ? Color.accentColor : Color.accentColor.opacity(0.14))
-                .foregroundStyle(isSelected ? Color.white : Color.accentColor)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color.accentColor.opacity(0.14))
+                .foregroundStyle(Color.accentColor)
+                .clipShape(Capsule())
         }
     }
 
     @ViewBuilder
-    private func chapterSelectorRow(label: String, selectedIndex: Binding<Int>) -> some View {
-        let safeIdx = min(max(0, selectedIndex.wrappedValue), max(viewModel.chapters.count - 1, 0))
-        let currentName = viewModel.chapters.indices.contains(safeIdx)
-            ? "\(safeIdx + 1). \(viewModel.chapters[safeIdx].cleanChapterName)"
-            : "Chưa chọn"
+    private func chapterSelectorRow(label: String, selectedIndex: Int, onTap: @escaping () -> Void) -> some View {
+        let safeIdx = max(0, min(selectedIndex, max(viewModel.chapters.count - 1, 0)))
+        let chapter = viewModel.chapters.isEmpty ? nil : viewModel.chapters[safeIdx]
+        let isTranslated = chapter.map { LocalChapterStorage.shared.isChapterTranslated($0.id) } ?? false
 
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
+        Button(action: onTap) {
+            HStack(spacing: 10) {
                 Text(label)
-                    .font(.caption.weight(.semibold))
+                    .font(.subheadline.weight(.medium))
                     .foregroundStyle(.secondary)
+                    .frame(width: 86, alignment: .leading)
+
+                if let chapter {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("\(safeIdx + 1). \(chapter.cleanChapterName)")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+
+                        HStack(spacing: 4) {
+                            Image(systemName: isTranslated ? "checkmark.seal.fill" : "clock")
+                                .font(.system(size: 10, weight: .bold))
+                            Text(isTranslated ? "Đã dịch AI" : "Chưa dịch (Bản gốc)")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .foregroundStyle(isTranslated ? Color.green : Color.orange)
+                    }
+                }
 
                 Spacer()
 
-                HStack(spacing: 6) {
-                    Button {
-                        if selectedIndex.wrappedValue > 0 {
-                            selectedIndex.wrappedValue -= 1
-                        }
-                    } label: {
-                        Image(systemName: "minus")
-                            .font(.caption2.weight(.bold))
-                            .frame(width: 26, height: 26)
-                            .background(Color(.tertiarySystemBackground))
-                            .clipShape(Circle())
-                    }
-                    .disabled(selectedIndex.wrappedValue <= 0)
-
-                    Button {
-                        if selectedIndex.wrappedValue < viewModel.chapters.count - 1 {
-                            selectedIndex.wrappedValue += 1
-                        }
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.caption2.weight(.bold))
-                            .frame(width: 26, height: 26)
-                            .background(Color(.tertiarySystemBackground))
-                            .clipShape(Circle())
-                    }
-                    .disabled(selectedIndex.wrappedValue >= viewModel.chapters.count - 1)
-                }
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.secondary)
             }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 11)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
 
-            NavigationLink {
-                ChapterRangePickerListView(
-                    title: label.replacingOccurrences(of: ":", with: ""),
-                    chapters: viewModel.chapters,
-                    selectedIndex: selectedIndex
-                )
-            } label: {
-                HStack(spacing: 8) {
-                    Text(currentName)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(Color.accentColor)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(Color.accentColor)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
-                .background(Color(.tertiarySystemBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-            }
+    private func selectNextUntranslatedRange(count: Int) {
+        guard !viewModel.chapters.isEmpty else { return }
+        let startSearch = max(0, viewModel.currentChapterIndex)
+        if let firstUntranslated = (startSearch..<viewModel.chapters.count).first(where: {
+            !LocalChapterStorage.shared.isChapterTranslated(viewModel.chapters[$0].id)
+        }) {
+            viewModel.translateFromChapterIndex = firstUntranslated
+            viewModel.translateToChapterIndex = min(viewModel.chapters.count - 1, firstUntranslated + count - 1)
+        } else if let anyUntranslated = (0..<viewModel.chapters.count).first(where: {
+            !LocalChapterStorage.shared.isChapterTranslated(viewModel.chapters[$0].id)
+        }) {
+            viewModel.translateFromChapterIndex = anyUntranslated
+            viewModel.translateToChapterIndex = min(viewModel.chapters.count - 1, anyUntranslated + count - 1)
         }
     }
 }
 
-private struct ChapterRangePickerListView: View {
+// MARK: - Danh sách chọn chương có tìm kiếm, tự cuộn tới vị trí đang chọn và hiện rõ huy hiệu [Đã dịch] / [Chưa dịch]
+private struct ChapterSelectionListModal: View {
     let title: String
     let chapters: [DriveItem]
-    @Binding var selectedIndex: Int
+    let selectedIndex: Int
+    let onSelect: (Int) -> Void
+
     @Environment(\.dismiss) private var dismiss
     @State private var searchText: String = ""
+    @State private var filterUntranslatedOnly: Bool = false
 
-    private var filteredItems: [(offset: Int, element: DriveItem)] {
-        let all = Array(chapters.enumerated())
+    private var filteredItems: [(index: Int, chapter: DriveItem, isTranslated: Bool)] {
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !q.isEmpty else { return all }
-        return all.filter { idx, chap in
-            "\(idx + 1)".contains(q) || chap.cleanChapterName.lowercased().contains(q)
+        return chapters.enumerated().compactMap { idx, chap in
+            let translated = LocalChapterStorage.shared.isChapterTranslated(chap.id)
+            if filterUntranslatedOnly && translated {
+                return nil
+            }
+            if !q.isEmpty {
+                let matchTitle = chap.cleanChapterName.lowercased().contains(q)
+                let matchNum = "\(idx + 1)".contains(q)
+                if !matchTitle && !matchNum {
+                    return nil
+                }
+            }
+            return (idx, chap, translated)
         }
     }
 
     var body: some View {
-        ScrollViewReader { proxy in
-            List {
-                ForEach(filteredItems, id: \.element.id) { idx, chap in
-                    Button {
-                        selectedIndex = idx
-                        dismiss()
-                    } label: {
-                        HStack(spacing: 10) {
-                            Text("\(idx + 1).")
-                                .font(.caption.weight(.bold))
-                                .foregroundStyle(.secondary)
-                                .frame(width: 38, alignment: .leading)
-
-                            Text(chap.cleanChapterName)
-                                .font(.subheadline.weight(selectedIndex == idx ? .bold : .regular))
-                                .foregroundStyle(selectedIndex == idx ? Color.accentColor : Color.primary)
-                                .lineLimit(1)
-
-                            Spacer()
-
-                            if selectedIndex == idx {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundStyle(Color.accentColor)
+        NavigationStack {
+            VStack(spacing: 0) {
+                VStack(spacing: 8) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundStyle(.secondary)
+                        TextField("Tìm số chương hoặc tên chương...", text: $searchText)
+                            .font(.subheadline)
+                        if !searchText.isEmpty {
+                            Button {
+                                searchText = ""
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
                             }
                         }
                     }
-                    .id(idx)
+                    .padding(9)
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                    Toggle("Chỉ hiện các chương chưa dịch", isOn: $filterUntranslatedOnly)
+                        .font(.caption.weight(.semibold))
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Color(.systemBackground))
+
+                Divider()
+
+                ScrollViewReader { proxy in
+                    List {
+                        ForEach(filteredItems, id: \.chapter.id) { item in
+                            let isCurrentSelected = (item.index == selectedIndex)
+
+                            Button {
+                                onSelect(item.index)
+                                dismiss()
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Text("\(item.index + 1)")
+                                        .font(.caption.weight(.bold))
+                                        .frame(width: 34, height: 34)
+                                        .background(isCurrentSelected ? Color.accentColor : Color(.secondarySystemBackground))
+                                        .foregroundStyle(isCurrentSelected ? .white : .primary)
+                                        .clipShape(Circle())
+
+                                    Text(item.chapter.cleanChapterName)
+                                        .font(.subheadline.weight(isCurrentSelected ? .bold : .regular))
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(2)
+
+                                    Spacer()
+
+                                    if item.isTranslated {
+                                        HStack(spacing: 3) {
+                                            Image(systemName: "checkmark.seal.fill")
+                                            Text("Đã dịch")
+                                        }
+                                        .font(.system(size: 11, weight: .bold))
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Color.green.opacity(0.16))
+                                        .foregroundStyle(Color.green)
+                                        .clipShape(Capsule())
+                                    } else {
+                                        Text("Chưa dịch")
+                                            .font(.system(size: 11, weight: .medium))
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 4)
+                                            .background(Color.secondary.opacity(0.12))
+                                            .foregroundStyle(.secondary)
+                                            .clipShape(Capsule())
+                                    }
+                                }
+                                .padding(.vertical, 2)
+                            }
+                            .id(item.index)
+                        }
+                    }
+                    .listStyle(.plain)
+                    .onAppear {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            proxy.scrollTo(selectedIndex, anchor: .center)
+                        }
+                    }
                 }
             }
-            .listStyle(.plain)
-            .searchable(text: $searchText, prompt: "Tìm số chương hoặc tên chương...")
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
-            .onAppear {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    proxy.scrollTo(selectedIndex, anchor: .center)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Đóng") {
+                        dismiss()
+                    }
                 }
             }
         }

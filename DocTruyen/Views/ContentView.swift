@@ -33,7 +33,7 @@ struct ContentView: View {
 
             if !viewModel.toastMessage.isEmpty {
                 toastCapsule
-                    .padding(.bottom, viewModel.screenMode == .reader ? 76 : 24)
+                    .padding(.bottom, viewModel.screenMode == .reader ? 68 : 24)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
@@ -49,55 +49,57 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Top Navigation Header
+    // MARK: - Top Navigation Header (Thu gọn tối đa khi đọc truyện để nhường chỗ cho nội dung)
     @ViewBuilder
     private func headerBar(palette: ThemePalette) -> some View {
         if viewModel.screenMode == .reader {
-            HStack(spacing: 10) {
+            let _ = viewModel.translatedRevisionTrigger
+            let isTranslated = viewModel.selectedChapter.map {
+                LocalChapterStorage.shared.isChapterTranslated($0.id)
+            } ?? false
+
+            HStack(spacing: 6) {
                 Button {
                     Task { await viewModel.navigateBack() }
                 } label: {
                     Image(systemName: "chevron.left")
-                        .font(.system(size: 16, weight: .bold))
-                        .frame(width: 36, height: 36)
-                        .background(palette.accent.opacity(0.15))
+                        .font(.system(size: 13, weight: .bold))
+                        .frame(width: 28, height: 28)
+                        .background(palette.accent.opacity(0.14))
                         .foregroundStyle(palette.accent)
                         .clipShape(Circle())
                 }
 
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        Text(viewModel.selectedChapter?.cleanChapterName ?? "Đang đọc")
-                            .font(.subheadline.weight(.bold))
-                            .foregroundStyle(palette.primaryText)
-                            .lineLimit(1)
-
-                        if let chap = viewModel.selectedChapter,
-                           LocalChapterStorage.shared.isChapterTranslated(chap.id) {
-                            Image(systemName: "checkmark.seal.fill")
-                                .font(.caption)
-                                .foregroundStyle(.green)
-                        }
+                HStack(spacing: 4) {
+                    if isTranslated {
+                        Image(systemName: "checkmark.seal.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.green)
                     }
-
-                    Text("Chương \(max(viewModel.currentChapterIndex + 1, 1))/\(viewModel.chapters.count) • \(viewModel.selectedGeminiModel.shortBadge)")
-                        .font(.caption2)
-                        .foregroundStyle(palette.secondaryText)
+                    Text(viewModel.selectedChapter?.cleanChapterName ?? "Đang đọc")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(palette.primaryText)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-                Spacer()
+                Text("\(max(viewModel.currentChapterIndex + 1, 1))/\(viewModel.chapters.count)")
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(palette.secondaryText)
 
+                // Nút Dịch gọn nhẹ trên 1 dòng
                 Button {
                     viewModel.prepareAndOpenTranslationPopup()
                 } label: {
-                    HStack(spacing: 5) {
+                    HStack(spacing: 3) {
                         Image(systemName: "sparkles")
-                            .font(.caption.weight(.bold))
-                        Text("Dịch truyện")
-                            .font(.caption.weight(.bold))
+                            .font(.system(size: 10, weight: .bold))
+                        Text("Dịch")
+                            .font(.system(size: 11, weight: .bold))
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
                     .background(
                         LinearGradient(
                             colors: [Color.orange, Color(red: 0.85, green: 0.35, blue: 0.12)],
@@ -107,16 +109,15 @@ struct ContentView: View {
                     )
                     .foregroundStyle(.white)
                     .clipShape(Capsule())
-                    .shadow(color: Color.orange.opacity(0.3), radius: 4, x: 0, y: 2)
                 }
 
                 Button {
                     viewModel.openTableOfContents()
                 } label: {
                     Image(systemName: "list.bullet")
-                        .font(.system(size: 15, weight: .bold))
-                        .frame(width: 36, height: 36)
-                        .background(palette.accent.opacity(0.15))
+                        .font(.system(size: 13, weight: .bold))
+                        .frame(width: 28, height: 28)
+                        .background(palette.accent.opacity(0.14))
                         .foregroundStyle(palette.accent)
                         .clipShape(Circle())
                 }
@@ -125,20 +126,20 @@ struct ContentView: View {
                     viewModel.showSettingsSheet = true
                 } label: {
                     Image(systemName: "gearshape.fill")
-                        .font(.system(size: 15, weight: .bold))
-                        .frame(width: 36, height: 36)
-                        .background(palette.accent.opacity(0.15))
+                        .font(.system(size: 13, weight: .bold))
+                        .frame(width: 28, height: 28)
+                        .background(palette.accent.opacity(0.14))
                         .foregroundStyle(palette.accent)
                         .clipShape(Circle())
                 }
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
             .background(palette.headerBackground)
             .overlay(
                 Rectangle()
-                    .fill(palette.border)
-                    .frame(height: 1),
+                    .fill(palette.border.opacity(0.7))
+                    .frame(height: 0.5),
                 alignment: .bottom
             )
         } else {
@@ -519,85 +520,49 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Reader View (Always Scrolls to Top on New Chapter)
+    // MARK: - Reader View (Tối ưu không gian đọc rộng rãi, sạch sẽ, không lặp lại khối tiêu đề rườm rà)
     @ViewBuilder
     private func readerContentView(palette: ThemePalette) -> some View {
         let _ = viewModel.translatedRevisionTrigger
-        let isCurrentTranslated = viewModel.selectedChapter.map {
-            LocalChapterStorage.shared.isChapterTranslated($0.id)
-        } ?? false
+        let cleanedStoryText = formatCleanStoryBody(viewModel.chapterContent)
 
         VStack(spacing: 0) {
             ScrollViewReader { scrollProxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 14) {
                         Color.clear
                             .frame(height: 1)
                             .id("READER_TOP_ANCHOR")
 
-                        // Chapter Title Banner inside Reader
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                if isCurrentTranslated {
-                                    Label("Bản dịch biên tập mượt bởi Gemini AI", systemImage: "sparkles")
-                                        .font(.caption.weight(.bold))
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 5)
-                                        .background(Color.green.opacity(0.16))
-                                        .foregroundStyle(Color.green)
-                                        .clipShape(Capsule())
-                                } else {
-                                    Label("Đã lưu bộ nhớ máy (Không cần tải lại)", systemImage: "internaldrive.fill")
-                                        .font(.caption.weight(.medium))
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 5)
-                                        .background(palette.border.opacity(0.5))
-                                        .foregroundStyle(palette.secondaryText)
-                                        .clipShape(Capsule())
-                                }
+                        // Tiêu đề chương gọn nhẹ bên trong trang đọc
+                        Text(viewModel.selectedChapter?.cleanChapterName ?? "")
+                            .font(.system(size: 17, weight: .bold, design: .serif))
+                            .foregroundStyle(palette.secondaryText)
+                            .padding(.bottom, 2)
 
-                                Spacer()
-
-                                Button {
-                                    viewModel.prepareAndOpenTranslationPopup()
-                                } label: {
-                                    Label("Dịch từ chương... đến chương...", systemImage: "wand.and.stars")
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(Color.orange)
-                                }
-                            }
-
-                            Text(viewModel.selectedChapter?.cleanChapterName ?? "")
-                                .font(.title3.weight(.heavy))
-                                .foregroundStyle(palette.primaryText)
-                        }
-                        .padding(.bottom, 6)
-
-                        Divider()
-
-                        // Story Body Text
-                        Text(viewModel.chapterContent)
+                        // Nội dung truyện chính (đã tự động làm sạch ký hiệu ### Markdown dư thừa)
+                        Text(cleanedStoryText)
                             .font(.system(size: viewModel.storyFontSize, weight: .regular, design: .serif))
-                            .lineSpacing(viewModel.storyFontSize * 0.58)
+                            .lineSpacing(viewModel.storyFontSize * 0.56)
                             .foregroundStyle(palette.primaryText)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
 
                         Divider()
-                            .padding(.top, 16)
+                            .padding(.top, 12)
 
-                        // Bottom Chapter Navigation Bar
-                        HStack(spacing: 12) {
+                        // Thanh chuyển chương phía cuối
+                        HStack(spacing: 10) {
                             Button {
                                 Task { await viewModel.openPreviousChapter() }
                             } label: {
-                                HStack {
+                                HStack(spacing: 5) {
                                     Image(systemName: "arrow.left")
                                     Text("Chương trước")
                                 }
                                 .font(.subheadline.weight(.bold))
                                 .frame(maxWidth: .infinity)
-                                .padding(.vertical, 13)
+                                .padding(.vertical, 12)
                                 .background(palette.cardBackground)
                                 .foregroundStyle(viewModel.currentChapterIndex > 0 ? palette.primaryText : palette.secondaryText.opacity(0.4))
                                 .overlay(
@@ -612,9 +577,9 @@ struct ContentView: View {
                                 viewModel.openTableOfContents()
                             } label: {
                                 Image(systemName: "list.bullet.rectangle.portrait")
-                                    .font(.title3.weight(.semibold))
+                                    .font(.body.weight(.semibold))
                                     .padding(.horizontal, 14)
-                                    .padding(.vertical, 13)
+                                    .padding(.vertical, 12)
                                     .background(palette.cardBackground)
                                     .foregroundStyle(palette.accent)
                                     .overlay(
@@ -627,13 +592,13 @@ struct ContentView: View {
                             Button {
                                 Task { await viewModel.openNextChapter() }
                             } label: {
-                                HStack {
+                                HStack(spacing: 5) {
                                     Text("Chương sau")
                                     Image(systemName: "arrow.right")
                                 }
                                 .font(.subheadline.weight(.bold))
                                 .frame(maxWidth: .infinity)
-                                .padding(.vertical, 13)
+                                .padding(.vertical, 12)
                                 .background(
                                     viewModel.currentChapterIndex < viewModel.chapters.count - 1
                                         ? palette.accent
@@ -644,13 +609,12 @@ struct ContentView: View {
                             }
                             .disabled(viewModel.currentChapterIndex >= viewModel.chapters.count - 1)
                         }
-                        .padding(.top, 8)
-                        .padding(.bottom, 30)
+                        .padding(.top, 6)
+                        .padding(.bottom, 26)
                     }
-                    .padding(.horizontal, 18)
-                    .padding(.top, 14)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
                 }
-                // Định danh duy nhất theo chương + token để SwiftUI làm mới ScrollView về đầu trang (y = 0) ngay lập tức
                 .id("READER_SCROLL_\(viewModel.selectedChapter?.id ?? "none")_\(viewModel.readerScrollResetToken)")
                 .onAppear {
                     scrollProxy.scrollTo("READER_TOP_ANCHOR", anchor: .top)
@@ -663,6 +627,19 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    /// Loại bỏ các dấu `### ` hoặc `**` dư thừa ở đầu dòng do AI sinh ra để trang truyện sạch đẹp
+    private func formatCleanStoryBody(_ raw: String) -> String {
+        let lines = raw.components(separatedBy: .newlines)
+        let cleaned = lines.map { line -> String in
+            var s = line
+            if let range = s.range(of: #"^#{1,6}\s+"#, options: .regularExpression) {
+                s.removeSubrange(range)
+            }
+            return s.replacingOccurrences(of: "**", with: "")
+        }
+        return cleaned.joined(separator: "\n")
     }
 
     // MARK: - Supporting Views
