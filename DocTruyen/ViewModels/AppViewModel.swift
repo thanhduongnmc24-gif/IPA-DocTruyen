@@ -15,7 +15,7 @@ final class AppViewModel: ObservableObject {
     }
 
     // MARK: - Storage Keys
-    private let readingStateStorageKey = "DOC_TRUYEN_READING_STATES_SWIFT_V1"
+    private let readingStateStorageKey = "DOC_TRUYEN_READING_STATES_SWIFT_V2"
     private let geminiApiKeyStorageKey = "DOC_TRUYEN_GEMINI_API_KEY"
     private let geminiPromptStorageKey = "DOC_TRUYEN_GEMINI_PROMPT"
     private let geminiModelStorageKey = "DOC_TRUYEN_GEMINI_MODEL"
@@ -35,6 +35,9 @@ final class AppViewModel: ObservableObject {
     @Published var selectedChapter: DriveItem?
     @Published var chapterContent: String = ""
     @Published var searchQuery: String = ""
+
+    /// Tăng mỗi khi chuyển sang chương mới để ép ScrollView tạo mới và cuộn về đầu trang (y = 0)
+    @Published var readerScrollResetToken: Int = 0
 
     @Published var isLoading: Bool = false
     @Published var errorMessage: String = ""
@@ -90,7 +93,7 @@ final class AppViewModel: ObservableObject {
     @Published var translationStatusNote: String = ""
     @Published var translatedRevisionTrigger: Int = 0
 
-    // MARK: - Caches
+    // MARK: - In-Memory Caches (kết hợp cùng Disk Cache trong LocalChapterStorage)
     private var folderCache: [String: (mode: ScreenMode, folders: [DriveItem], chapters: [DriveItem])] = [:]
     private var chapterContentCache: [String: String] = [:]
     private var prefetchingIds: Set<String> = []
@@ -223,9 +226,10 @@ final class AppViewModel: ObservableObject {
 
     func applyCustomDriveSettingsAndReload() async {
         folderCache.removeAll()
+        LocalChapterStorage.shared.clearFolderDiskCache()
         let rootNode = FolderNode(id: activeRootFolderId, name: "Thư viện truyện")
         folderStack = [rootNode]
-        _ = await loadFolder(rootNode)
+        _ = await loadFolder(rootNode, forceRefreshFromDrive: true)
         showToast("Đã cập nhật kết nối Google Drive")
     }
 
@@ -273,7 +277,7 @@ final class AppViewModel: ObservableObject {
         persistReadingData()
     }
 
-    // MARK: - App Initialization & Folder Loading
+    // MARK: - App Initialization & Instant Offline Restore
     func initializeApp() async {
         let rootNode = FolderNode(id: activeRootFolderId, name: "Thư viện truyện")
         folderStack = [rootNode]
@@ -282,11 +286,37 @@ final class AppViewModel: ObservableObject {
         readingStates = saved.states
         lastReadingFolderId = saved.lastReadingFolderId
 
+        // Khôi phục ngay lập tức chương đang đọc từ bộ nhớ đệm trên máy mà không cần gọi lại Google Drive
         if let lastId = saved.lastReadingFolderId,
            let lastState = saved.states[lastId],
            let lastFolder = lastState.folderStack.last,
            !lastFolder.id.isEmpty {
             folderStack = lastState.folderStack
+
+            if let diskFolder = LocalChapterStorage.shared.loadFolderSnapshotFromDisk(folderId: lastFolder.id),
+               !diskFolder.chapters.isEmpty,
+               let savedChapter = diskFolder.chapters.first(where: { $0.id == lastState.chapterId }),
+               let localChapterText = LocalChapterStorage.shared.readChapterContent(chapterId: savedChapter.id),
+               !localChapterText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+
+                let cachedTuple: (mode: ScreenMode, folders: [DriveItem], chapters: [DriveItem]) = (.chapters, [], diskFolder.chapters)
+                folderCache[lastFolder.id] = cachedTuple
+                chapterContentCache[savedChapter.id] = localChapterText
+
+                chapters = diskFolder.chapters
+                folders = []
+                selectedChapter = savedChapter
+                chapterContent = localChapterText
+                screenMode = .reader
+                readerScrollResetToken += 1
+
+                if let idx = diskFolder.chapters.firstIndex(where: { $0.id == savedChapter.id }) {
+                    tocStartIndex = computeTocStart(for: idx)
+                    prefetchNextChapter(after: idx)
+                }
+                return
+            }
+
             if let loaded = await loadFolder(lastFolder, silent: true),
                !loaded.chapters.isEmpty,
                let savedChapter = loaded.chapters.first(where: { $0.id == lastState.chapterId }) {
@@ -303,22 +333,41 @@ final class AppViewModel: ObservableObject {
 
     func refreshCurrentFolder() async {
         folderCache.removeValue(forKey: currentFolder.id)
-        _ = await loadFolder(currentFolder)
+        LocalChapterStorage.shared.clearFolderDiskCache(folderId: currentFolder.id)
+        _ = await loadFolder(currentFolder, forceRefreshFromDrive: true)
     }
 
-    func loadFolder(_ folder: FolderNode, silent: Bool = false) async -> (mode: ScreenMode, folders: [DriveItem], chapters: [DriveItem])? {
+    func loadFolder(
+        _ folder: FolderNode,
+        silent: Bool = false,
+        forceRefreshFromDrive: Bool = false
+    ) async -> (mode: ScreenMode, folders: [DriveItem], chapters: [DriveItem])? {
         errorMessage = ""
         tocVisible = false
         nextSwipePromptVisible = false
         searchQuery = ""
 
-        if let cached = folderCache[folder.id] {
-            if !silent {
-                screenMode = cached.mode
-                folders = cached.folders
-                chapters = cached.chapters
+        if !forceRefreshFromDrive {
+            if let cached = folderCache[folder.id] {
+                if !silent {
+                    screenMode = cached.mode
+                    folders = cached.folders
+                    chapters = cached.chapters
+                }
+                return cached
             }
-            return cached
+
+            if let diskCached = LocalChapterStorage.shared.loadFolderSnapshotFromDisk(folderId: folder.id) {
+                let mode: ScreenMode = diskCached.isChaptersMode ? .chapters : .folders
+                let tuple = (mode: mode, folders: diskCached.folders, chapters: diskCached.chapters)
+                folderCache[folder.id] = tuple
+                if !silent {
+                    screenMode = mode
+                    folders = diskCached.folders
+                    chapters = diskCached.chapters
+                }
+                return tuple
+            }
         }
 
         if !silent {
@@ -341,6 +390,12 @@ final class AppViewModel: ObservableObject {
             if !txtFiles.isEmpty {
                 let result: (mode: ScreenMode, folders: [DriveItem], chapters: [DriveItem]) = (.chapters, [], txtFiles)
                 folderCache[folder.id] = result
+                LocalChapterStorage.shared.saveFolderSnapshotToDisk(
+                    folderId: folder.id,
+                    isChaptersMode: true,
+                    folders: [],
+                    chapters: txtFiles
+                )
                 if !silent {
                     screenMode = .chapters
                     folders = []
@@ -370,6 +425,12 @@ final class AppViewModel: ObservableObject {
 
             let result: (mode: ScreenMode, folders: [DriveItem], chapters: [DriveItem]) = (.folders, enrichedFolders, [])
             folderCache[folder.id] = result
+            LocalChapterStorage.shared.saveFolderSnapshotToDisk(
+                folderId: folder.id,
+                isChaptersMode: false,
+                folders: enrichedFolders,
+                chapters: []
+            )
             if !silent {
                 screenMode = .folders
                 folders = enrichedFolders
@@ -413,10 +474,10 @@ final class AppViewModel: ObservableObject {
     // MARK: - Chapter Reading & Local File Caching / Overwriting
     func fetchChapterText(_ chapter: DriveItem, forceRemote: Bool = false) async throws -> String {
         if !forceRemote {
-            if let localOverride = LocalChapterStorage.shared.readChapterContent(chapterId: chapter.id),
-               !localOverride.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                chapterContentCache[chapter.id] = localOverride
-                return localOverride
+            if let localSaved = LocalChapterStorage.shared.readChapterContent(chapterId: chapter.id),
+               !localSaved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                chapterContentCache[chapter.id] = localSaved
+                return localSaved
             }
             if let cached = chapterContentCache[chapter.id] {
                 return cached
@@ -441,16 +502,32 @@ final class AppViewModel: ObservableObject {
     }
 
     func openChapter(_ chapter: DriveItem) async {
-        isLoading = true
         errorMessage = ""
         selectedChapter = chapter
         tocVisible = false
         nextSwipePromptVisible = false
 
+        if let localSaved = LocalChapterStorage.shared.readChapterContent(chapterId: chapter.id),
+           !localSaved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            chapterContentCache[chapter.id] = localSaved
+            chapterContent = localSaved
+            screenMode = .reader
+            readerScrollResetToken += 1
+
+            if let idx = chapters.firstIndex(where: { $0.id == chapter.id }) {
+                tocStartIndex = computeTocStart(for: idx)
+                prefetchNextChapter(after: idx)
+            }
+            saveReadingProgress(paragraphIndex: 0, chapterOverride: chapter)
+            return
+        }
+
+        isLoading = true
         do {
             let text = try await fetchChapterText(chapter)
             chapterContent = text
             screenMode = .reader
+            readerScrollResetToken += 1
 
             if let idx = chapters.firstIndex(where: { $0.id == chapter.id }) {
                 tocStartIndex = computeTocStart(for: idx)
@@ -479,7 +556,8 @@ final class AppViewModel: ObservableObject {
     private func prefetchNextChapter(after index: Int) {
         guard index + 1 < chapters.count else { return }
         let nextChap = chapters[index + 1]
-        guard chapterContentCache[nextChap.id] == nil,
+        guard !LocalChapterStorage.shared.hasLocalFile(for: nextChap.id),
+              chapterContentCache[nextChap.id] == nil,
               !prefetchingIds.contains(nextChap.id) else { return }
 
         prefetchingIds.insert(nextChap.id)
@@ -575,7 +653,6 @@ final class AppViewModel: ObservableObject {
                         switchedModelNotice = " (Đã tự động chuyển sang \(outcome.usedModelChoice.shortBadge) do hết quota)"
                     }
 
-                    // 1. Ghi đè nội dung của file cũ trên bộ nhớ máy bằng nội dung đã dịch
                     try LocalChapterStorage.shared.overwriteChapterFile(
                         chapterId: chapter.id,
                         chapterName: chapter.name,
@@ -583,15 +660,12 @@ final class AppViewModel: ObservableObject {
                         markAsTranslated: true
                     )
 
-                    // 2. Cập nhật bộ nhớ đệm trong app
                     chapterContentCache[chapter.id] = outcome.translatedText
 
-                    // 3. Nếu chương vừa dịch chính là chương đang mở đọc -> thay thế ngay nội dung gốc trên màn hình
                     if selectedChapter?.id == chapter.id {
                         chapterContent = outcome.translatedText
                     }
 
-                    // 4. Đồng bộ ghi đè lên file Google Drive gốc nếu người dùng có cấu hình quyền ghi
                     _ = await DriveService.shared.overwriteRemoteDriveFileIfPossible(
                         fileId: chapter.id,
                         content: outcome.translatedText,
@@ -626,6 +700,7 @@ final class AppViewModel: ObservableObject {
             let original = try await fetchChapterText(chapter, forceRemote: true)
             if selectedChapter?.id == chapter.id {
                 chapterContent = original
+                readerScrollResetToken += 1
             }
             translatedRevisionTrigger += 1
             showToast("Đã khôi phục bản gốc từ Google Drive")
