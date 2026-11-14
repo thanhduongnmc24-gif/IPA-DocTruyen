@@ -1,0 +1,73 @@
+name: Build Unsigned IPA to Releases
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+
+    env:
+      GOOGLE_DRIVE_API_KEY: ${{ secrets.GOOGLE_DRIVE_API_KEY }}
+      GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Inject Google Drive Secrets into Info.plist
+        run: |
+          /usr/libexec/PlistBuddy -c "Set :GoogleDriveAPIKey ${GOOGLE_DRIVE_API_KEY}" DocTruyen/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :GoogleDriveFolderID ${GOOGLE_DRIVE_FOLDER_ID}" DocTruyen/Info.plist
+          echo "✅ Đã cấu hình Google Drive API Key & Folder ID vào Info.plist"
+
+      - name: Generate Xcode Project with XcodeGen
+        run: |
+          if ! command -v xcodegen &> /dev/null; then
+            brew install xcodegen
+          fi
+          xcodegen generate
+          echo "✅ Đã khởi tạo DocTruyen.xcodeproj từ mã nguồn Swift"
+
+      - name: Build Unsigned Archive (SwiftUI Native)
+        run: |
+          mkdir -p build
+          xcodebuild archive \
+            -project DocTruyen.xcodeproj \
+            -scheme DocTruyen \
+            -configuration Release \
+            -archivePath build/DocTruyen.xcarchive \
+            -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM=""
+
+      - name: Package IPA from Archive
+        run: |
+          mkdir -p build/Payload
+          cp -R build/DocTruyen.xcarchive/Products/Applications/*.app build/Payload/
+          cd build
+          zip -r -9 Doc-truyen.ipa Payload
+          ls -lh Doc-truyen.ipa
+
+      - name: Generate Tag Name
+        id: tag
+        run: |
+          echo "release_tag=build-$(date +'%Y.%m.%d-%H%M')" >> $GITHUB_OUTPUT
+
+      - name: Release to GitHub
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          name: Bản Build Swift ${{ steps.tag.outputs.release_tag }}
+          body: "Bản build SwiftUI Native (Unsigned IPA) tích hợp AI Gemini 3.5/3.1 Flash Lite dịch & biên tập truyện. Dùng ESign/Scarlet/TrollStore để cài đặt."
+          files: build/Doc-truyen.ipa
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

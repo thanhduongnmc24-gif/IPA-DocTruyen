@@ -1,0 +1,7 @@
+build/
+DerivedData/
+*.xcuserdata
+*.xcworkspace
+.DS_Store
+*.ipa
+*.xcarchive
