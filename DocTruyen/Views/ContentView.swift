@@ -8,7 +8,7 @@ struct ContentView: View {
 
         ZStack(alignment: .bottom) {
             palette.background
-                .ignoresSafeArea()
+                .ignoresSafeArea(.all)
 
             VStack(spacing: 0) {
                 headerBar(palette: palette)
@@ -30,6 +30,7 @@ struct ContentView: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
             if !viewModel.toastMessage.isEmpty {
                 toastCapsule
@@ -37,6 +38,7 @@ struct ContentView: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .animation(.easeInOut(duration: 0.2), value: viewModel.toastMessage)
         .sheet(isPresented: $viewModel.showSettingsSheet) {
             SettingsSheetView(viewModel: viewModel)
@@ -53,29 +55,31 @@ struct ContentView: View {
     @ViewBuilder
     private func headerBar(palette: ThemePalette) -> some View {
         if viewModel.screenMode == .reader {
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Button {
                     Task { await viewModel.navigateBack() }
                 } label: {
                     Image(systemName: "chevron.left")
-                        .font(.system(size: 16, weight: .bold))
-                        .frame(width: 36, height: 36)
+                        .font(.system(size: 15, weight: .bold))
+                        .frame(width: 34, height: 34)
                         .background(palette.accent.opacity(0.15))
                         .foregroundStyle(palette.accent)
                         .clipShape(Circle())
                 }
+                .fixedSize()
 
                 VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 4) {
                         Text(viewModel.selectedChapter?.cleanChapterName ?? "Đang đọc")
                             .font(.subheadline.weight(.bold))
                             .foregroundStyle(palette.primaryText)
                             .lineLimit(1)
+                            .truncationMode(.tail)
 
                         if let chap = viewModel.selectedChapter,
                            LocalChapterStorage.shared.isChapterTranslated(chap.id) {
                             Image(systemName: "checkmark.seal.fill")
-                                .font(.caption)
+                                .font(.caption2)
                                 .foregroundStyle(.green)
                         }
                     }
@@ -83,22 +87,24 @@ struct ContentView: View {
                     Text("Chương \(max(viewModel.currentChapterIndex + 1, 1))/\(viewModel.chapters.count) • \(viewModel.selectedGeminiModel.shortBadge)")
                         .font(.caption2)
                         .foregroundStyle(palette.secondaryText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.85)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-                Spacer()
-
-                // Nút Dịch Truyện nổi bật ngay trên thanh đọc chương
+                // Nút Dịch Truyện cố định trên 1 dòng, không bị ép gãy chữ dọc
                 Button {
                     viewModel.prepareAndOpenTranslationPopup()
                 } label: {
-                    HStack(spacing: 5) {
+                    HStack(spacing: 4) {
                         Image(systemName: "sparkles")
+                            .font(.caption2.weight(.bold))
+                        Text("Dịch AI")
                             .font(.caption.weight(.bold))
-                        Text("Dịch truyện")
-                            .font(.caption.weight(.bold))
+                            .lineLimit(1)
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
                     .background(
                         LinearGradient(
                             colors: [Color.orange, Color(red: 0.85, green: 0.35, blue: 0.12)],
@@ -108,32 +114,35 @@ struct ContentView: View {
                     )
                     .foregroundStyle(.white)
                     .clipShape(Capsule())
-                    .shadow(color: Color.orange.opacity(0.3), radius: 4, x: 0, y: 2)
+                    .shadow(color: Color.orange.opacity(0.28), radius: 3, x: 0, y: 2)
                 }
+                .fixedSize(horizontal: true, vertical: false)
 
                 Button {
                     viewModel.openTableOfContents()
                 } label: {
                     Image(systemName: "list.bullet")
-                        .font(.system(size: 15, weight: .bold))
-                        .frame(width: 36, height: 36)
+                        .font(.system(size: 14, weight: .bold))
+                        .frame(width: 34, height: 34)
                         .background(palette.accent.opacity(0.15))
                         .foregroundStyle(palette.accent)
                         .clipShape(Circle())
                 }
+                .fixedSize()
 
                 Button {
                     viewModel.showSettingsSheet = true
                 } label: {
                     Image(systemName: "gearshape.fill")
-                        .font(.system(size: 15, weight: .bold))
-                        .frame(width: 36, height: 36)
+                        .font(.system(size: 14, weight: .bold))
+                        .frame(width: 34, height: 34)
                         .background(palette.accent.opacity(0.15))
                         .foregroundStyle(palette.accent)
                         .clipShape(Circle())
                 }
+                .fixedSize()
             }
-            .padding(.horizontal, 14)
+            .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .background(palette.headerBackground)
             .overlay(
@@ -156,6 +165,7 @@ struct ContentView: View {
                                 .foregroundStyle(.white)
                                 .clipShape(Circle())
                         }
+                        .fixedSize()
                     }
 
                     VStack(alignment: .leading, spacing: 2) {
@@ -169,14 +179,15 @@ struct ContentView: View {
                             Text("\(viewModel.chapters.count) chương • Đã dịch AI: \(translatedCount) chương")
                                 .font(.caption)
                                 .foregroundStyle(palette.secondaryText)
+                                .lineLimit(1)
                         } else {
                             Text("Kho truyện Google Drive • AI Gemini Editor")
                                 .font(.caption)
                                 .foregroundStyle(palette.secondaryText)
+                                .lineLimit(1)
                         }
                     }
-
-                    Spacer()
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                     if viewModel.screenMode == .chapters && !viewModel.chapters.isEmpty {
                         Button {
@@ -185,6 +196,7 @@ struct ContentView: View {
                             HStack(spacing: 4) {
                                 Image(systemName: "sparkles")
                                 Text("Dịch AI")
+                                    .lineLimit(1)
                             }
                             .font(.caption.weight(.bold))
                             .padding(.horizontal, 11)
@@ -193,6 +205,7 @@ struct ContentView: View {
                             .foregroundStyle(.white)
                             .clipShape(Capsule())
                         }
+                        .fixedSize(horizontal: true, vertical: false)
                     }
 
                     if viewModel.screenMode == .folders {
@@ -206,6 +219,7 @@ struct ContentView: View {
                                 .foregroundStyle(palette.accent)
                                 .clipShape(Circle())
                         }
+                        .fixedSize()
                     }
 
                     Button {
@@ -218,6 +232,7 @@ struct ContentView: View {
                             .foregroundStyle(palette.accent)
                             .clipShape(Circle())
                     }
+                    .fixedSize()
                 }
 
                 // Search Bar
@@ -474,6 +489,7 @@ struct ContentView: View {
                                     HStack(spacing: 4) {
                                         Image(systemName: "sparkles")
                                         Text("Đã dịch")
+                                            .lineLimit(1)
                                     }
                                     .font(.system(size: 11, weight: .bold))
                                     .padding(.horizontal, 9)
@@ -481,6 +497,7 @@ struct ContentView: View {
                                     .background(Color.green.opacity(0.16))
                                     .foregroundStyle(Color.green)
                                     .clipShape(Capsule())
+                                    .fixedSize(horizontal: true, vertical: false)
                                 }
 
                                 Image(systemName: "chevron.right")
@@ -525,40 +542,51 @@ struct ContentView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     // Chapter Title Banner inside Reader
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 8) {
                             if isCurrentTranslated {
-                                Label("Bản dịch biên tập mượt bởi Gemini AI", systemImage: "sparkles")
+                                Label("Đã biên tập mượt bởi Gemini AI", systemImage: "sparkles")
                                     .font(.caption.weight(.bold))
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.85)
                                     .padding(.horizontal, 10)
-                                    .padding(.vertical, 5)
+                                    .padding(.vertical, 6)
                                     .background(Color.green.opacity(0.16))
                                     .foregroundStyle(Color.green)
                                     .clipShape(Capsule())
                             } else {
-                                Label("Bản gốc (Chưa biên tập AI)", systemImage: "doc.text")
+                                Label("Bản gốc (Chưa dịch AI)", systemImage: "doc.text")
                                     .font(.caption.weight(.medium))
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.85)
                                     .padding(.horizontal, 10)
-                                    .padding(.vertical, 5)
+                                    .padding(.vertical, 6)
                                     .background(palette.border.opacity(0.5))
                                     .foregroundStyle(palette.secondaryText)
                                     .clipShape(Capsule())
                             }
 
-                            Spacer()
+                            Spacer(minLength: 4)
 
                             Button {
                                 viewModel.prepareAndOpenTranslationPopup()
                             } label: {
-                                Label("Dịch từ chương... đến chương...", systemImage: "wand.and.stars")
+                                Label("Dịch nhiều chương", systemImage: "wand.and.stars")
                                     .font(.caption.weight(.semibold))
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(Color.orange.opacity(0.14))
                                     .foregroundStyle(Color.orange)
+                                    .clipShape(Capsule())
                             }
+                            .fixedSize(horizontal: true, vertical: false)
                         }
 
                         Text(viewModel.selectedChapter?.cleanChapterName ?? "")
                             .font(.title3.weight(.heavy))
                             .foregroundStyle(palette.primaryText)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .padding(.bottom, 6)
 
@@ -580,9 +608,10 @@ struct ContentView: View {
                         Button {
                             Task { await viewModel.openPreviousChapter() }
                         } label: {
-                            HStack {
+                            HStack(spacing: 6) {
                                 Image(systemName: "arrow.left")
                                 Text("Chương trước")
+                                    .lineLimit(1)
                             }
                             .font(.subheadline.weight(.bold))
                             .frame(maxWidth: .infinity)
@@ -616,8 +645,9 @@ struct ContentView: View {
                         Button {
                             Task { await viewModel.openNextChapter() }
                         } label: {
-                            HStack {
+                            HStack(spacing: 6) {
                                 Text("Chương sau")
+                                    .lineLimit(1)
                                 Image(systemName: "arrow.right")
                             }
                             .font(.subheadline.weight(.bold))
@@ -677,7 +707,7 @@ struct ContentView: View {
                 .foregroundStyle(palette.secondaryText)
             Spacer()
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func emptyStateView(icon: String, title: String, subtitle: String, palette: ThemePalette) -> some View {

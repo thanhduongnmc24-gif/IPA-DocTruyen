@@ -23,7 +23,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Inject Google Drive Secrets into Info.plist & Swift Config
+      - name: Generate Xcode Project with XcodeGen
+        run: |
+          if ! command -v xcodegen &> /dev/null; then
+            brew install xcodegen
+          fi
+          xcodegen generate
+          echo "✅ Đã khởi tạo DocTruyen.xcodeproj"
+
+      - name: Inject Google Drive Secrets & FullScreen Launch Config into Info.plist
         run: |
           python3 - << 'EOF'
           import os, plistlib
@@ -34,12 +42,15 @@ jobs:
           print(f"Detected Drive API Key length: {len(api_key)}")
           print(f"Detected Drive Folder ID length: {len(folder_id)}")
 
-          # 1. Ghi trực tiếp vào Info.plist
+          # 1. Ghi trực tiếp vào Info.plist SAU khi chạy xcodegen để không bị xcodegen ghi đè mất UILaunchScreen
           plist_path = "DocTruyen/Info.plist"
           with open(plist_path, "rb") as f:
               pl = plistlib.load(f)
           pl["GoogleDriveAPIKey"] = api_key
           pl["GoogleDriveFolderID"] = folder_id
+          pl["UILaunchStoryboardName"] = "LaunchScreen"
+          pl["UILaunchScreen"] = {"UIColorName": "", "UIImageName": ""}
+          pl["UIRequiresFullScreen"] = True
           with open(plist_path, "wb") as f:
               plistlib.dump(pl, f)
 
@@ -52,14 +63,6 @@ jobs:
               f.write(f'    static let googleDriveFolderId = "{folder_id}"\n')
               f.write("}\n")
           EOF
-
-      - name: Generate Xcode Project with XcodeGen
-        run: |
-          if ! command -v xcodegen &> /dev/null; then
-            brew install xcodegen
-          fi
-          xcodegen generate
-          echo "✅ Đã khởi tạo DocTruyen.xcodeproj"
 
       - name: Build Unsigned Archive (SwiftUI Native)
         run: |

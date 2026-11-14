@@ -5,6 +5,10 @@ struct TranslationRangeSheetView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var showPromptEditor: Bool = false
 
+    private var selectedSpanCount: Int {
+        abs(viewModel.translateToChapterIndex - viewModel.translateFromChapterIndex) + 1
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -18,11 +22,12 @@ struct TranslationRangeSheetView: View {
                                     startPoint: .topLeading,
                                     endPoint: .bottomTrailing
                                 ))
-                                .frame(width: 48, height: 48)
+                                .frame(width: 46, height: 46)
                             Image(systemName: "sparkles")
-                                .font(.title2.weight(.bold))
+                                .font(.title3.weight(.bold))
                                 .foregroundStyle(.white)
                         }
+                        .fixedSize()
 
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Dịch & Biên tập lại truyện")
@@ -42,87 +47,47 @@ struct TranslationRangeSheetView: View {
                         Text("Chọn phạm vi chương cần dịch")
                             .font(.subheadline.weight(.bold))
 
-                        HStack(spacing: 12) {
-                            Button {
+                        // 3 nút chọn nhanh luôn nằm gọn trên 1 dòng, bằng nhau
+                        HStack(spacing: 8) {
+                            quickRangeButton(title: "Chỉ chương này", span: 1) {
                                 let idx = max(0, viewModel.currentChapterIndex)
                                 viewModel.translateFromChapterIndex = idx
                                 viewModel.translateToChapterIndex = idx
-                            } label: {
-                                Text("Chỉ chương này")
-                                    .font(.caption.weight(.semibold))
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
-                                    .background(Color.accentColor.opacity(0.14))
-                                    .foregroundStyle(Color.accentColor)
-                                    .clipShape(Capsule())
                             }
 
-                            Button {
+                            quickRangeButton(title: "5 chương tiếp", span: 5) {
                                 let idx = max(0, viewModel.currentChapterIndex)
                                 viewModel.translateFromChapterIndex = idx
-                                viewModel.translateToChapterIndex = min(viewModel.chapters.count - 1, idx + 4)
-                            } label: {
-                                Text("5 chương tiếp")
-                                    .font(.caption.weight(.semibold))
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
-                                    .background(Color.accentColor.opacity(0.14))
-                                    .foregroundStyle(Color.accentColor)
-                                    .clipShape(Capsule())
+                                viewModel.translateToChapterIndex = min(max(viewModel.chapters.count - 1, 0), idx + 4)
                             }
 
-                            Button {
+                            quickRangeButton(title: "10 chương tiếp", span: 10) {
                                 let idx = max(0, viewModel.currentChapterIndex)
                                 viewModel.translateFromChapterIndex = idx
-                                viewModel.translateToChapterIndex = min(viewModel.chapters.count - 1, idx + 9)
-                            } label: {
-                                Text("10 chương tiếp")
-                                    .font(.caption.weight(.semibold))
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
-                                    .background(Color.accentColor.opacity(0.14))
-                                    .foregroundStyle(Color.accentColor)
-                                    .clipShape(Capsule())
+                                viewModel.translateToChapterIndex = min(max(viewModel.chapters.count - 1, 0), idx + 9)
                             }
                         }
 
                         if !viewModel.chapters.isEmpty {
-                            VStack(spacing: 10) {
-                                HStack {
-                                    Text("Từ chương:")
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
-                                    Spacer()
-                                    Picker("Từ chương", selection: $viewModel.translateFromChapterIndex) {
-                                        ForEach(Array(viewModel.chapters.enumerated()), id: \.offset) { idx, chap in
-                                            Text("\(idx + 1). \(chap.cleanChapterName)").tag(idx)
-                                        }
-                                    }
-                                    .labelsHidden()
-                                }
+                            VStack(spacing: 12) {
+                                chapterSelectorRow(
+                                    label: "Từ chương:",
+                                    selectedIndex: $viewModel.translateFromChapterIndex
+                                )
 
                                 Divider()
 
-                                HStack {
-                                    Text("Đến chương:")
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
-                                    Spacer()
-                                    Picker("Đến chương", selection: $viewModel.translateToChapterIndex) {
-                                        ForEach(Array(viewModel.chapters.enumerated()), id: \.offset) { idx, chap in
-                                            Text("\(idx + 1). \(chap.cleanChapterName)").tag(idx)
-                                        }
-                                    }
-                                    .labelsHidden()
-                                }
+                                chapterSelectorRow(
+                                    label: "Đến chương:",
+                                    selectedIndex: $viewModel.translateToChapterIndex
+                                )
                             }
                             .padding(12)
                             .background(Color(.secondarySystemBackground))
                             .clipShape(RoundedRectangle(cornerRadius: 14))
                         }
 
-                        let totalSelected = abs(viewModel.translateToChapterIndex - viewModel.translateFromChapterIndex) + 1
-                        Text("Tổng cộng: **\(totalSelected) chương** sẽ được biên tập lại và ghi đè file gốc.")
+                        Text("Tổng cộng: **\(selectedSpanCount) chương** sẽ được biên tập lại và ghi đè file gốc.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -273,6 +238,154 @@ struct TranslationRangeSheetView: View {
                     Button("Đóng") {
                         dismiss()
                     }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func quickRangeButton(title: String, span: Int, action: @escaping () -> Void) -> some View {
+        let isSelected = (viewModel.translateFromChapterIndex == max(0, viewModel.currentChapterIndex)) && (selectedSpanCount == span)
+
+        Button(action: action) {
+            Text(title)
+                .font(.caption.weight(.bold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .padding(.horizontal, 6)
+                .background(isSelected ? Color.accentColor : Color.accentColor.opacity(0.14))
+                .foregroundStyle(isSelected ? Color.white : Color.accentColor)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
+    }
+
+    @ViewBuilder
+    private func chapterSelectorRow(label: String, selectedIndex: Binding<Int>) -> some View {
+        let safeIdx = min(max(0, selectedIndex.wrappedValue), max(viewModel.chapters.count - 1, 0))
+        let currentName = viewModel.chapters.indices.contains(safeIdx)
+            ? "\(safeIdx + 1). \(viewModel.chapters[safeIdx].cleanChapterName)"
+            : "Chưa chọn"
+
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(label)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                HStack(spacing: 6) {
+                    Button {
+                        if selectedIndex.wrappedValue > 0 {
+                            selectedIndex.wrappedValue -= 1
+                        }
+                    } label: {
+                        Image(systemName: "minus")
+                            .font(.caption2.weight(.bold))
+                            .frame(width: 26, height: 26)
+                            .background(Color(.tertiarySystemBackground))
+                            .clipShape(Circle())
+                    }
+                    .disabled(selectedIndex.wrappedValue <= 0)
+
+                    Button {
+                        if selectedIndex.wrappedValue < viewModel.chapters.count - 1 {
+                            selectedIndex.wrappedValue += 1
+                        }
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.caption2.weight(.bold))
+                            .frame(width: 26, height: 26)
+                            .background(Color(.tertiarySystemBackground))
+                            .clipShape(Circle())
+                    }
+                    .disabled(selectedIndex.wrappedValue >= viewModel.chapters.count - 1)
+                }
+            }
+
+            NavigationLink {
+                ChapterRangePickerListView(
+                    title: label.replacingOccurrences(of: ":", with: ""),
+                    chapters: viewModel.chapters,
+                    selectedIndex: selectedIndex
+                )
+            } label: {
+                HStack(spacing: 8) {
+                    Text(currentName)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(Color.accentColor)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(Color(.tertiarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+        }
+    }
+}
+
+private struct ChapterRangePickerListView: View {
+    let title: String
+    let chapters: [DriveItem]
+    @Binding var selectedIndex: Int
+    @Environment(\.dismiss) private var dismiss
+    @State private var searchText: String = ""
+
+    private var filteredItems: [(offset: Int, element: DriveItem)] {
+        let all = Array(chapters.enumerated())
+        let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return all }
+        return all.filter { idx, chap in
+            "\(idx + 1)".contains(q) || chap.cleanChapterName.lowercased().contains(q)
+        }
+    }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            List {
+                ForEach(filteredItems, id: \.element.id) { idx, chap in
+                    Button {
+                        selectedIndex = idx
+                        dismiss()
+                    } label: {
+                        HStack(spacing: 10) {
+                            Text("\(idx + 1).")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 38, alignment: .leading)
+
+                            Text(chap.cleanChapterName)
+                                .font(.subheadline.weight(selectedIndex == idx ? .bold : .regular))
+                                .foregroundStyle(selectedIndex == idx ? Color.accentColor : Color.primary)
+                                .lineLimit(1)
+
+                            Spacer()
+
+                            if selectedIndex == idx {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundStyle(Color.accentColor)
+                            }
+                        }
+                    }
+                    .id(idx)
+                }
+            }
+            .listStyle(.plain)
+            .searchable(text: $searchText, prompt: "Tìm số chương hoặc tên chương...")
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .onAppear {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    proxy.scrollTo(selectedIndex, anchor: .center)
                 }
             }
         }
