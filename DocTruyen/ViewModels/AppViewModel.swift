@@ -99,6 +99,10 @@ final class AppViewModel: ObservableObject {
     let tocWindowSize = 50
 
     var bundledDriveApiKey: String {
+        let secret = GeneratedSecrets.googleDriveApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !secret.isEmpty {
+            return secret
+        }
         let raw = (Bundle.main.object(forInfoDictionaryKey: "GoogleDriveAPIKey") as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if raw.isEmpty || raw == "__GOOGLE_DRIVE_API_KEY__" || raw.hasPrefix("$(") {
@@ -108,6 +112,10 @@ final class AppViewModel: ObservableObject {
     }
 
     var bundledRootFolderId: String {
+        let secret = GeneratedSecrets.googleDriveFolderId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !secret.isEmpty {
+            return DriveInputParser.extractFolderId(from: secret)
+        }
         let raw = (Bundle.main.object(forInfoDictionaryKey: "GoogleDriveFolderID") as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if raw.isEmpty || raw == "__GOOGLE_DRIVE_FOLDER_ID__" || raw.hasPrefix("$(") {

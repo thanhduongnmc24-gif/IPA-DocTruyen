@@ -16,16 +16,42 @@ jobs:
     env:
       GOOGLE_DRIVE_API_KEY: ${{ secrets.GOOGLE_DRIVE_API_KEY }}
       GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+      EXPO_PUBLIC_GOOGLE_DRIVE_API_KEY: ${{ secrets.EXPO_PUBLIC_GOOGLE_DRIVE_API_KEY }}
+      EXPO_PUBLIC_GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.EXPO_PUBLIC_GOOGLE_DRIVE_FOLDER_ID }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Inject Google Drive Secrets into Info.plist
+      - name: Inject Google Drive Secrets into Info.plist & Swift Config
         run: |
-          /usr/libexec/PlistBuddy -c "Set :GoogleDriveAPIKey ${GOOGLE_DRIVE_API_KEY}" DocTruyen/Info.plist
-          /usr/libexec/PlistBuddy -c "Set :GoogleDriveFolderID ${GOOGLE_DRIVE_FOLDER_ID}" DocTruyen/Info.plist
-          echo "✅ Đã cấu hình Google Drive API Key & Folder ID vào Info.plist"
+          python3 - << 'EOF'
+          import os, plistlib
+
+          api_key = (os.environ.get("GOOGLE_DRIVE_API_KEY") or os.environ.get("EXPO_PUBLIC_GOOGLE_DRIVE_API_KEY") or "").strip()
+          folder_id = (os.environ.get("GOOGLE_DRIVE_FOLDER_ID") or os.environ.get("EXPO_PUBLIC_GOOGLE_DRIVE_FOLDER_ID") or "").strip()
+
+          print(f"Detected Drive API Key length: {len(api_key)}")
+          print(f"Detected Drive Folder ID length: {len(folder_id)}")
+
+          # 1. Ghi trực tiếp vào Info.plist
+          plist_path = "DocTruyen/Info.plist"
+          with open(plist_path, "rb") as f:
+              pl = plistlib.load(f)
+          pl["GoogleDriveAPIKey"] = api_key
+          pl["GoogleDriveFolderID"] = folder_id
+          with open(plist_path, "wb") as f:
+              plistlib.dump(pl, f)
+
+          # 2. Ghi trực tiếp vào hằng số Swift (GeneratedSecrets.swift) để đảm bảo 100% có sẵn khi chạy
+          swift_secret_path = "DocTruyen/Models/GeneratedSecrets.swift"
+          with open(swift_secret_path, "w", encoding="utf-8") as f:
+              f.write("import Foundation\n\n")
+              f.write("enum GeneratedSecrets {\n")
+              f.write(f'    static let googleDriveApiKey = "{api_key}"\n')
+              f.write(f'    static let googleDriveFolderId = "{folder_id}"\n')
+              f.write("}\n")
+          EOF
 
       - name: Generate Xcode Project with XcodeGen
         run: |
@@ -33,7 +59,7 @@ jobs:
             brew install xcodegen
           fi
           xcodegen generate
-          echo "✅ Đã khởi tạo DocTruyen.xcodeproj từ mã nguồn Swift"
+          echo "✅ Đã khởi tạo DocTruyen.xcodeproj"
 
       - name: Build Unsigned Archive (SwiftUI Native)
         run: |
@@ -67,7 +93,7 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.release_tag }}
           name: Bản Build Swift ${{ steps.tag.outputs.release_tag }}
-          body: "Bản build SwiftUI Native (Unsigned IPA) tích hợp AI Gemini 3.5/3.1 Flash Lite dịch & biên tập truyện. Dùng ESign/Scarlet/TrollStore để cài đặt."
+          body: "Bản build SwiftUI Native tràn viền 100% kèm kết nối Google Drive & AI Gemini 3.5/3.1 Flash Lite."
           files: build/Doc-truyen.ipa
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
