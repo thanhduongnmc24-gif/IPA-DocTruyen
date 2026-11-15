@@ -20,14 +20,22 @@ enum DriveServiceError: LocalizedError {
     }
 }
 
+struct DriveOverwriteResult {
+    let success: Bool
+    let message: String
+}
+
 final class DriveService {
     static let shared = DriveService()
     private let session: URLSession
 
+    private var cachedAccessToken: String = ""
+    private var cachedAccessTokenExpiry: Date = .distantPast
+
     private init() {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 60
+        config.timeoutIntervalForRequest = 45
+        config.timeoutIntervalForResource = 120
         self.session = URLSession(configuration: config)
     }
 
@@ -135,34 +143,157 @@ final class DriveService {
         return text
     }
 
-    /// Ghi đè trực tiếp nội dung đã dịch lên file gốc trên Google Drive (nếu có OAuth Access Token hoặc quyền ghi)
-    func overwriteRemoteDriveFileIfPossible(fileId: String, content: String, apiKey: String, accessToken: String?) async -> Bool {
+    /// Tự động xin Access Token mới từ Refresh Token (vĩnh viễn không hết hạn) nếu có cấu hình
+    private func resolveValidAccessToken(
+        manualAccessToken: String?,
+        clientId: String?,
+        clientSecret: String?,
+        refreshToken: String?
+    ) async -> String? {
+        let cleanRefresh = refreshToken?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let cleanClientId = clientId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let cleanClientSecret = clientSecret?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if !cleanRefresh.isEmpty, !cleanClientId.isEmpty, !cleanClientSecret.isEmpty {
+            if !cachedAccessToken.isEmpty && Date() < cachedAccessTokenExpiry {
+                return cachedAccessToken
+            }
+
+            if let tokenURL = URL(string: "https://oauth2.googleapis.com/token") {
+                var req = URLRequest(url: tokenURL)
+                req.httpMethod = "POST"
+                req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+
+                var comps = URLComponents()
+                comps.queryItems = [
+                    URLQueryItem(name: "client_id", value: cleanClientId),
+                    URLQueryItem(name: "client_secret", value: cleanClientSecret),
+                    URLQueryItem(name: "refresh_token", value: cleanRefresh),
+                    URLQueryItem(name: "grant_type", value: "refresh_token")
+                ]
+                req.httpBody = comps.percentEncodedQuery?.data(using: .utf8)
+
+                if let (data, resp) = try? await session.data(for: req),
+                   let http = resp as? HTTPURLResponse,
+                   (200...299).contains(http.statusCode),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let newToken = json["access_token"] as? String {
+                    let expiresIn = (json["expires_in"] as? Double) ?? 3500
+                    cachedAccessToken = newToken
+                    cachedAccessTokenExpiry = Date().addingTimeInterval(max(60, expiresIn - 120))
+                    return newToken
+                }
+            }
+        }
+
+        let cleanManual = manualAccessToken?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return cleanManual.isEmpty ? nil : cleanManual
+    }
+
+    /// Ghi đè nội dung đã dịch và cập nhật tên chương lên thẳng Google Drive
+    /// Hỗ trợ 2 cơ chế:
+    /// 1. Qua Google Apps Script Web App URL (Đơn giản nhất: chỉ cần dán 1 link `https://script.google.com/macros/s/.../exec`, dùng vĩnh viễn không cần OAuth Token)
+    /// 2. Qua Google Drive REST API v3 (OAuth Access Token hoặc Refresh Token)
+    func overwriteRemoteDriveFile(
+        fileId: String,
+        newFileName: String?,
+        content: String,
+        apiKey: String,
+        appsScriptWebAppUrl: String?,
+        accessToken: String?,
+        clientId: String? = nil,
+        clientSecret: String? = nil,
+        refreshToken: String? = nil
+    ) async -> DriveOverwriteResult {
+        // ƯU TIÊN 1: Ghi đè qua Google Apps Script Web App Bridge nếu người dùng đã dán link
+        if let scriptUrlStr = appsScriptWebAppUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !scriptUrlStr.isEmpty,
+           let scriptUrl = URL(string: scriptUrlStr) {
+            var request = URLRequest(url: scriptUrl)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+            var payload: [String: Any] = [
+                "fileId": fileId,
+                "content": content
+            ]
+            if let newFileName, !newFileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let finalName = newFileName.lowercased().hasSuffix(".txt") ? newFileName : "\(newFileName).txt"
+                payload["newName"] = finalName
+            }
+
+            if let body = try? JSONSerialization.data(withJSONObject: payload) {
+                request.httpBody = body
+                do {
+                    let (data, response) = try await session.data(for: request)
+                    if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) {
+                        let respText = String(data: data, encoding: .utf8) ?? ""
+                        if respText.lowercased().contains("\"ok\":true") || respText.lowercased().contains("success") {
+                            return DriveOverwriteResult(success: true, message: "Đã ghi đè lên Google Drive (Apps Script)")
+                        }
+                    }
+                } catch {
+                    // Nếu Apps Script lỗi mạng thì thử tiếp phương án 2 bên dưới
+                }
+            }
+        }
+
+        // ƯU TIÊN 2: Ghi đè qua Google Drive API v3 với OAuth Token / Refresh Token
+        let resolvedToken = await resolveValidAccessToken(
+            manualAccessToken: accessToken,
+            clientId: clientId,
+            clientSecret: clientSecret,
+            refreshToken: refreshToken
+        )
+
+        guard let token = resolvedToken, !token.isEmpty else {
+            return DriveOverwriteResult(
+                success: false,
+                message: "Chỉ lưu trên máy (Chưa cấu hình Link Apps Script hoặc OAuth Token để ghi đè lên Drive)"
+            )
+        }
+
         var components = URLComponents(string: "https://www.googleapis.com/upload/drive/v3/files/\(fileId)")!
         components.queryItems = [
-            URLQueryItem(name: "uploadType", value: "media"),
-            URLQueryItem(name: "key", value: apiKey)
+            URLQueryItem(name: "uploadType", value: "media")
         ]
 
         guard let url = components.url, let bodyData = content.data(using: .utf8) else {
-            return false
+            return DriveOverwriteResult(success: false, message: "Lỗi tạo dữ liệu upload Drive")
         }
 
         var request = URLRequest(url: url)
         request.httpMethod = "PATCH"
         request.setValue("text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type")
-        if let token = accessToken?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
-            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.httpBody = bodyData
 
         do {
             let (_, response) = try await session.data(for: request)
             if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) {
-                return true
+                // Nếu có đổi tên chương thì cập nhật luôn tên file trên Google Drive
+                if let newFileName, !newFileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let finalName = newFileName.lowercased().hasSuffix(".txt") ? newFileName : "\(newFileName).txt"
+                    await renameRemoteDriveFile(fileId: fileId, newName: finalName, bearerToken: token)
+                }
+                return DriveOverwriteResult(success: true, message: "Đã ghi đè lên Google Drive")
+            } else {
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                return DriveOverwriteResult(success: false, message: "Drive từ chối ghi đè (HTTP \(code))")
             }
         } catch {
-            return false
+            return DriveOverwriteResult(success: false, message: "Lỗi mạng khi ghi lên Drive")
         }
-        return false
+    }
+
+    private func renameRemoteDriveFile(fileId: String, newName: String, bearerToken: String) async {
+        guard let url = URL(string: "https://www.googleapis.com/drive/v3/files/\(fileId)") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(bearerToken)", forHTTPHeaderField: "Authorization")
+        let body = ["name": newName]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        _ = try? await session.data(for: request)
     }
 }
