@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @StateObject private var viewModel = AppViewModel()
@@ -12,11 +13,6 @@ struct ContentView: View {
 
             VStack(spacing: 0) {
                 headerBar(palette: palette)
-
-                // Thanh trạng thái nhỏ gọn khi đang dịch hoặc ghi đè ngầm lên Google Drive (không chặn việc đọc truyện)
-                if viewModel.isTranslatingBatch || viewModel.isSyncingToDrive {
-                    backgroundSyncBanner(palette: palette)
-                }
 
                 if !viewModel.errorMessage.isEmpty {
                     errorBanner
@@ -54,50 +50,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Thanh tiến trình chạy ngầm (Vừa dịch/ghi đè Drive vừa đọc truyện thoải mái)
-    @ViewBuilder
-    private func backgroundSyncBanner(palette: ThemePalette) -> some View {
-        Button {
-            if viewModel.isTranslatingBatch {
-                viewModel.showTranslationPopup = true
-            } else {
-                viewModel.showSettingsSheet = true
-            }
-        } label: {
-            HStack(spacing: 8) {
-                ProgressView()
-                    .scaleEffect(0.8)
-                    .tint(.orange)
-
-                Text(viewModel.isTranslatingBatch
-                     ? (viewModel.translationStatusNote.isEmpty
-                        ? "Đang dịch & ghi đè (\(viewModel.translationProgressCount)/\(viewModel.translationTotalCount))..."
-                        : viewModel.translationStatusNote)
-                     : viewModel.driveSyncStatusNote)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(palette.primaryText)
-                    .lineLimit(1)
-
-                Spacer()
-
-                Text("Xem")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundStyle(palette.accent)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(palette.cardBackground)
-            .overlay(
-                Rectangle()
-                    .fill(palette.border.opacity(0.8))
-                    .frame(height: 0.5),
-                alignment: .bottom
-            )
-        }
-        .buttonStyle(.plain)
-    }
-
-    // MARK: - Top Navigation Header
+    // MARK: - Top Navigation Header (Đã bỏ dòng chữ "Đang dịch..." và bỏ "Thư viện truyện / Kho truyện Google Drive...")
     @ViewBuilder
     private func headerBar(palette: ThemePalette) -> some View {
         if viewModel.screenMode == .reader {
@@ -143,7 +96,6 @@ struct ContentView: View {
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                     .foregroundStyle(palette.secondaryText)
 
-                // Nút Dịch gọn nhẹ trên 1 dòng
                 Button {
                     viewModel.prepareAndOpenTranslationPopup()
                 } label: {
@@ -200,7 +152,67 @@ struct ContentView: View {
                     .frame(height: 0.5),
                 alignment: .bottom
             )
+        } else if viewModel.screenMode == .folders && !viewModel.canNavigateBack {
+            // Màn hình danh sách bộ truyện ở thư mục gốc: Gọn gàng trên 1 hàng duy nhất (Không có chữ "Thư viện truyện / Kho truyện Google Drive...")
+            HStack(spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(palette.secondaryText)
+                    TextField("Tìm tên bộ truyện...", text: $viewModel.searchQuery)
+                        .font(.subheadline)
+                        .foregroundStyle(palette.primaryText)
+
+                    if !viewModel.searchQuery.isEmpty {
+                        Button {
+                            viewModel.searchQuery = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(palette.secondaryText)
+                        }
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(palette.cardBackground)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(palette.border, lineWidth: 1)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                Button {
+                    viewModel.folderLayoutMode = (viewModel.folderLayoutMode == .grid) ? .list : .grid
+                } label: {
+                    Image(systemName: viewModel.folderLayoutMode == .grid ? "list.bullet" : "square.grid.2x2.fill")
+                        .font(.system(size: 15, weight: .bold))
+                        .frame(width: 38, height: 38)
+                        .background(palette.accent.opacity(0.15))
+                        .foregroundStyle(palette.accent)
+                        .clipShape(Circle())
+                }
+
+                Button {
+                    viewModel.showSettingsSheet = true
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 15, weight: .bold))
+                        .frame(width: 38, height: 38)
+                        .background(palette.accent.opacity(0.15))
+                        .foregroundStyle(palette.accent)
+                        .clipShape(Circle())
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(palette.headerBackground)
+            .overlay(
+                Rectangle()
+                    .fill(palette.border)
+                    .frame(height: 1),
+                alignment: .bottom
+            )
         } else {
+            // Màn hình danh sách chương của 1 bộ truyện (hoặc thư mục con)
             let _ = viewModel.translatedRevisionTrigger
             VStack(spacing: 10) {
                 HStack(spacing: 10) {
@@ -229,10 +241,6 @@ struct ContentView: View {
                             Text("\(viewModel.chapters.count) chương • Đã dịch: \(translatedCount) • Lên Drive: \(syncedCount)")
                                 .font(.caption)
                                 .foregroundStyle(palette.secondaryText)
-                        } else {
-                            Text("Kho truyện Google Drive • AI Gemini Editor")
-                                .font(.caption)
-                                .foregroundStyle(palette.secondaryText)
                         }
                     }
 
@@ -244,7 +252,9 @@ struct ContentView: View {
                         } label: {
                             HStack(spacing: 4) {
                                 Image(systemName: "sparkles")
-                                Text("Dịch AI")
+                                Text(viewModel.isTranslatingBatch
+                                     ? "\(viewModel.translationProgressCount)/\(viewModel.translationTotalCount)"
+                                     : "Dịch AI")
                             }
                             .font(.caption.weight(.bold))
                             .fixedSize(horizontal: true, vertical: false)
@@ -325,6 +335,8 @@ struct ContentView: View {
     // MARK: - Folders View (Grid & List)
     @ViewBuilder
     private func foldersContentView(palette: ThemePalette) -> some View {
+        let _ = viewModel.coverRevisionTrigger
+
         ScrollView {
             if viewModel.filteredFolders.isEmpty {
                 emptyStateView(
@@ -358,6 +370,30 @@ struct ContentView: View {
         }
     }
 
+    @ViewBuilder
+    private func storyCoverThumbnail(folder: DriveItem, palette: ThemePalette) -> some View {
+        if let localImage = LocalChapterStorage.shared.loadCachedCoverImage(for: folder.id) {
+            Image(uiImage: localImage)
+                .resizable()
+                .scaledToFill()
+        } else if let coverUrl = folder.coverUrl,
+                  !coverUrl.hasPrefix("local://"),
+                  let url = URL(string: coverUrl) {
+            AsyncImage(url: url) { phase in
+                switch phase {
+                case .success(let image):
+                    image
+                        .resizable()
+                        .scaledToFill()
+                default:
+                    defaultCoverPlaceholder(palette: palette)
+                }
+            }
+        } else {
+            defaultCoverPlaceholder(palette: palette)
+        }
+    }
+
     private func folderGridCard(folder: DriveItem, palette: ThemePalette) -> some View {
         let saved = viewModel.readingStates[folder.id]
 
@@ -366,24 +402,10 @@ struct ContentView: View {
         } label: {
             VStack(alignment: .leading, spacing: 10) {
                 ZStack(alignment: .bottomLeading) {
-                    if let coverUrl = folder.coverUrl, let url = URL(string: coverUrl) {
-                        AsyncImage(url: url) { phase in
-                            switch phase {
-                            case .success(let image):
-                                image
-                                    .resizable()
-                                    .scaledToFill()
-                            default:
-                                defaultCoverPlaceholder(palette: palette)
-                            }
-                        }
+                    storyCoverThumbnail(folder: folder, palette: palette)
                         .frame(height: 200)
                         .frame(maxWidth: .infinity)
                         .clipped()
-                    } else {
-                        defaultCoverPlaceholder(palette: palette)
-                            .frame(height: 200)
-                    }
 
                     if let savedChap = saved?.chapterName {
                         Text("Đang đọc: \(savedChap.replacingOccurrences(of: ".txt", with: ""))")
@@ -423,24 +445,10 @@ struct ContentView: View {
             Task { await viewModel.openFolder(folder) }
         } label: {
             HStack(spacing: 14) {
-                if let coverUrl = folder.coverUrl, let url = URL(string: coverUrl) {
-                    AsyncImage(url: url) { phase in
-                        switch phase {
-                        case .success(let image):
-                            image
-                                .resizable()
-                                .scaledToFill()
-                        default:
-                            defaultCoverPlaceholder(palette: palette)
-                        }
-                    }
+                storyCoverThumbnail(folder: folder, palette: palette)
                     .frame(width: 68, height: 92)
+                    .clipped()
                     .clipShape(RoundedRectangle(cornerRadius: 10))
-                } else {
-                    defaultCoverPlaceholder(palette: palette)
-                        .frame(width: 68, height: 92)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                }
 
                 VStack(alignment: .leading, spacing: 6) {
                     Text(folder.name)
@@ -607,7 +615,6 @@ struct ContentView: View {
                             .frame(height: 1)
                             .id("READER_TOP_ANCHOR")
 
-                        // Tiêu đề chương gọn nhẹ bên trong trang đọc
                         Text(viewModel.selectedChapter?.cleanChapterName ?? "")
                             .font(.system(size: 17, weight: .bold, design: .serif))
                             .foregroundStyle(palette.secondaryText)
@@ -624,7 +631,6 @@ struct ContentView: View {
                             .padding(.vertical, 20)
                         }
 
-                        // Nội dung truyện chính
                         Text(cleanedStoryText)
                             .font(.system(size: viewModel.storyFontSize, weight: .regular, design: .serif))
                             .lineSpacing(viewModel.storyFontSize * 0.56)
@@ -635,7 +641,6 @@ struct ContentView: View {
                         Divider()
                             .padding(.top, 12)
 
-                        // Thanh chuyển chương phía cuối
                         HStack(spacing: 10) {
                             Button {
                                 Task { await viewModel.openPreviousChapter() }

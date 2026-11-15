@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 enum DriveServiceError: LocalizedError {
     case missingCredentials
@@ -25,9 +26,6 @@ struct DriveOverwriteResult {
     let message: String
 }
 
-/// Xử lý chuyển hướng HTTP 302/303 của Google Apps Script Web App (`script.google.com` -> `script.googleusercontent.com`)
-/// để URLSession không giữ lại header `Content-Type: application/json` trên request GET sau khi redirect,
-/// tránh lỗi treo hoặc ngắt kết nối sau khi ghi đè vài chương liên tiếp.
 private final class AppsScriptRedirectDelegate: NSObject, URLSessionTaskDelegate {
     func urlSession(
         _ session: URLSession,
@@ -75,12 +73,13 @@ final class DriveService {
         "https://www.googleapis.com/drive/v3/files/\(fileId)?alt=media&key=\(apiKey)"
     }
 
-    // MARK: - Tải danh sách Thư mục & Chương truyện (Có dự phòng qua Apps Script)
+    // MARK: - Tải danh sách Thư mục & Chương truyện
     func listChildren(
         folderId: String,
         apiKey: String,
         appsScriptWebAppUrl: String? = nil,
-        extraQuery: String = ""
+        extraQuery: String = "",
+        pageSize: Int = 1000
     ) async throws -> [DriveItem] {
         let trimmedFolder = DriveInputParser.extractFolderId(from: folderId)
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -90,7 +89,6 @@ final class DriveService {
             throw DriveServiceError.missingCredentials
         }
 
-        // 1. Thử tải qua Google Drive API v3 nếu có API Key
         var lastDriveError: Error?
         if !trimmedKey.isEmpty {
             for attempt in 1...3 {
@@ -98,18 +96,18 @@ final class DriveService {
                     return try await listChildrenViaDriveAPI(
                         folderId: trimmedFolder,
                         apiKey: trimmedKey,
-                        extraQuery: extraQuery
+                        extraQuery: extraQuery,
+                        pageSize: pageSize
                     )
                 } catch {
                     lastDriveError = error
                     if attempt < 3 {
-                        try? await Task.sleep(nanoseconds: UInt64(attempt) * 800_000_000)
+                        try? await Task.sleep(nanoseconds: UInt64(attempt) * 700_000_000)
                     }
                 }
             }
         }
 
-        // 2. Dự phòng: Nếu API Key lỗi/trống nhưng người dùng đã dán Link Apps Script hỗ trợ listFolder
         if !cleanScriptUrl.isEmpty && extraQuery.isEmpty {
             if let viaScript = try? await listChildrenViaAppsScript(folderId: trimmedFolder, scriptUrlStr: cleanScriptUrl),
                !viaScript.isEmpty {
@@ -126,7 +124,8 @@ final class DriveService {
     private func listChildrenViaDriveAPI(
         folderId: String,
         apiKey: String,
-        extraQuery: String
+        extraQuery: String,
+        pageSize: Int = 1000
     ) async throws -> [DriveItem] {
         var allFiles: [DriveItem] = []
         var pageToken = ""
@@ -140,7 +139,7 @@ final class DriveService {
                 URLQueryItem(name: "q", value: finalQuery),
                 URLQueryItem(name: "fields", value: "nextPageToken,files(id,name,mimeType,modifiedTime,thumbnailLink)"),
                 URLQueryItem(name: "orderBy", value: "name_natural"),
-                URLQueryItem(name: "pageSize", value: "1000"),
+                URLQueryItem(name: "pageSize", value: "\(min(max(pageSize, 1), 1000))"),
                 URLQueryItem(name: "key", value: apiKey)
             ]
 
@@ -163,7 +162,7 @@ final class DriveService {
             }
 
             allFiles.append(contentsOf: decoded?.files ?? [])
-            pageToken = decoded?.nextPageToken ?? ""
+            pageToken = (pageSize < 1000) ? "" : (decoded?.nextPageToken ?? "")
         } while !pageToken.isEmpty
 
         return allFiles
@@ -188,23 +187,107 @@ final class DriveService {
         return []
     }
 
-    func fetchFolderCover(folderId: String, apiKey: String) async -> String? {
-        do {
-            let children = try await listChildren(
+    // MARK: - Tìm và tải file ảnh đại diện (tên bất kỳ, đuôi bất kỳ) trong mỗi thư mục truyện
+    /// Trong thư mục mỗi truyện gồm các file .txt và 1 file ảnh với tên & đuôi bất kỳ:
+    /// Tìm ngay file không phải thư mục và không phải .txt, tải về và lưu vào bộ nhớ đệm trên máy.
+    func fetchAndCacheFolderCover(
+        folderId: String,
+        apiKey: String,
+        appsScriptWebAppUrl: String? = nil
+    ) async -> String? {
+        if LocalChapterStorage.shared.hasCachedCoverImage(for: folderId) {
+            return "local://cover/\(folderId)"
+        }
+
+        // Tìm mọi file trong thư mục truyện mà KHÔNG phải là folder và KHÔNG có đuôi .txt
+        // (Không giới hạn mimeType contains 'image/' để bắt được mọi tên và mọi đuôi ảnh bất kỳ)
+        var candidateFile: DriveItem?
+
+        if let nonTxtFiles = try? await listChildren(
+            folderId: folderId,
+            apiKey: apiKey,
+            appsScriptWebAppUrl: appsScriptWebAppUrl,
+            extraQuery: "mimeType != 'application/vnd.google-apps.folder' and not name contains '.txt'",
+            pageSize: 20
+        ) {
+            candidateFile = nonTxtFiles.first(where: { !$0.isFolder && !$0.isTextFile })
+        }
+
+        // Dự phòng: Nếu câu truy vấn lọc nâng cao không trả về, kiểm tra theo mimeType image/
+        if candidateFile == nil {
+            if let imageFiles = try? await listChildren(
                 folderId: folderId,
                 apiKey: apiKey,
-                extraQuery: "mimeType contains 'image/'"
-            )
-            guard let imageFile = children.first(where: { $0.isImageFile }) else {
-                return nil
+                appsScriptWebAppUrl: appsScriptWebAppUrl,
+                extraQuery: "mimeType contains 'image/'",
+                pageSize: 20
+            ) {
+                candidateFile = imageFiles.first(where: { !$0.isFolder && !$0.isTextFile })
             }
-            return imageFile.thumbnailLink ?? fileMediaURLString(fileId: imageFile.id, apiKey: apiKey)
-        } catch {
+        }
+
+        guard let coverFile = candidateFile else {
             return nil
         }
+
+        if await downloadAndCacheCoverFile(coverFile, forFolderId: folderId, apiKey: apiKey) {
+            return "local://cover/\(folderId)"
+        }
+
+        return coverFile.thumbnailLink ?? "https://drive.google.com/thumbnail?id=\(coverFile.id)&sz=w600"
     }
 
-    // MARK: - Tải nội dung chương truyện (Tự động vượt chặn Google Drive bằng nhiều kênh dự phòng)
+    /// Tải dữ liệu ảnh từ nhiều nguồn dự phòng của Google Drive (hỗ trợ mọi định dạng ảnh) và lưu vào ổ đĩa
+    @discardableResult
+    func downloadAndCacheCoverFile(
+        _ file: DriveItem,
+        forFolderId folderId: String,
+        apiKey: String
+    ) async -> Bool {
+        if LocalChapterStorage.shared.hasCachedCoverImage(for: folderId) {
+            return true
+        }
+
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        var candidateURLStrings: [String] = []
+
+        // 1. Nếu Google Drive trả sẵn thumbnailLink -> Nâng độ phân giải lên =s600
+        if let thumb = file.thumbnailLink, !thumb.isEmpty {
+            let highResThumb = thumb.replacingOccurrences(of: "=s220", with: "=s600")
+            candidateURLStrings.append(highResThumb)
+        }
+
+        // 2. Cổng thumbnail chính thức của Google Drive (tự động giải mã mọi đuôi ảnh bất kỳ sang JPEG/PNG)
+        candidateURLStrings.append("https://drive.google.com/thumbnail?id=\(file.id)&sz=w600")
+        candidateURLStrings.append("https://lh3.googleusercontent.com/d/\(file.id)=w600")
+
+        // 3. Tải file gốc qua API Key
+        if !trimmedKey.isEmpty {
+            candidateURLStrings.append(fileMediaURLString(fileId: file.id, apiKey: trimmedKey))
+        }
+
+        // 4. Cổng uc?export=download
+        candidateURLStrings.append("https://drive.google.com/uc?export=download&id=\(file.id)&confirm=t")
+
+        for urlStr in candidateURLStrings {
+            guard let url = URL(string: urlStr) else { continue }
+            var req = URLRequest(url: url)
+            req.setValue("image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+            req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+            if let (data, resp) = try? await session.data(for: req),
+               let http = resp as? HTTPURLResponse,
+               (200...299).contains(http.statusCode),
+               !data.isEmpty,
+               LocalChapterStorage.shared.saveCachedCoverImageData(data, for: folderId) != nil {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    // MARK: - Tải nội dung chương truyện
     func downloadTextFile(
         fileId: String,
         apiKey: String,
@@ -217,7 +300,6 @@ final class DriveService {
 
         var lastError: Error = DriveServiceError.missingCredentials
 
-        // KÊNH 1: Tải qua Google Drive API v3 (alt=media&key=...) kèm retry
         if !trimmedKey.isEmpty, let url = URL(string: fileMediaURLString(fileId: fileId, apiKey: trimmedKey)) {
             for attempt in 1...2 {
                 do {
@@ -256,7 +338,6 @@ final class DriveService {
             }
         }
 
-        // KÊNH 2: Nếu kênh 1 bị Google chặn tải tự động (403 / HTML), thử tải qua Link Apps Script nếu người dùng đã cấu hình
         if !cleanScriptUrl.isEmpty {
             if let scriptText = await downloadTextViaAppsScript(fileId: fileId, scriptUrlStr: cleanScriptUrl),
                !scriptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -264,7 +345,6 @@ final class DriveService {
             }
         }
 
-        // KÊNH 3: Dự phòng tải qua cổng uc?export=download&confirm=t của Google Drive
         if let fallbackUrl = URL(string: "https://drive.google.com/uc?export=download&id=\(fileId)&confirm=t") {
             var req = URLRequest(url: fallbackUrl)
             req.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
@@ -288,7 +368,6 @@ final class DriveService {
     }
 
     private func downloadTextViaAppsScript(fileId: String, scriptUrlStr: String) async -> String? {
-        // Thử gọi GET ?action=read&fileId=... trước
         if var comps = URLComponents(string: scriptUrlStr) {
             var q = comps.queryItems ?? []
             q.append(URLQueryItem(name: "action", value: "read"))
@@ -306,7 +385,6 @@ final class DriveService {
             }
         }
 
-        // Thử gọi POST {"action": "read", "fileId": fileId}
         guard let scriptUrl = URL(string: scriptUrlStr) else { return nil }
         var request = URLRequest(url: scriptUrl)
         request.httpMethod = "POST"
@@ -374,7 +452,7 @@ final class DriveService {
         return cleanManual.isEmpty ? nil : cleanManual
     }
 
-    // MARK: - Ghi đè nội dung đã dịch và cập nhật tên chương lên thẳng Google Drive (Có Retry chống rớt chương)
+    // MARK: - Ghi đè nội dung đã dịch và cập nhật tên chương lên thẳng Google Drive
     func overwriteRemoteDriveFile(
         fileId: String,
         newFileName: String?,
@@ -389,7 +467,6 @@ final class DriveService {
         let cleanScriptUrl = DriveInputParser.normalizeAppsScriptUrl(appsScriptWebAppUrl ?? "")
         var lastScriptFailureReason: String?
 
-        // ƯU TIÊN 1: Ghi đè qua Google Apps Script Web App Bridge (thử tối đa 4 lần nếu nghẽn mạng / giới hạn tần suất)
         if !cleanScriptUrl.isEmpty, let scriptUrl = URL(string: cleanScriptUrl) {
             var payload: [String: Any] = [
                 "action": "overwrite",
@@ -410,8 +487,6 @@ final class DriveService {
 
                     var request = URLRequest(url: scriptUrl)
                     request.httpMethod = "POST"
-                    // Dùng text/plain;charset=utf-8 giúp Google Apps Script nhận nguyên chuỗi JSON trong e.postData.contents
-                    // mà không bị kẹt preflight/redirect 302 khi gọi liên tiếp nhiều chương
                     request.setValue("text/plain;charset=utf-8", forHTTPHeaderField: "Content-Type")
                     request.httpBody = body
 
@@ -453,7 +528,6 @@ final class DriveService {
                         lastScriptFailureReason = error.localizedDescription
                     }
 
-                    // Nghỉ tăng dần (1.2s -> 2.4s -> 3.6s) trước khi thử lại để tránh giới hạn tốc độ của Apps Script
                     if attempt < 4 {
                         let backoffNs = UInt64(attempt) * 1_200_000_000
                         try? await Task.sleep(nanoseconds: backoffNs)
@@ -462,7 +536,6 @@ final class DriveService {
             }
         }
 
-        // ƯU TIÊN 2: Ghi đè qua Google Drive API v3 với OAuth Token / Refresh Token
         let resolvedToken = await resolveValidAccessToken(
             manualAccessToken: accessToken,
             clientId: clientId,

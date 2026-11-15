@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 struct CachedFolderDiskPayload: Codable {
     let folderId: String
@@ -15,6 +16,7 @@ final class LocalChapterStorage {
     private let chaptersDirectory: URL
     private let originalChaptersDirectory: URL
     private let foldersCacheDirectory: URL
+    private let coversCacheDirectory: URL
     private let metadataFileURL: URL
     private let driveSyncedFileURL: URL
     private let customTitlesFileURL: URL
@@ -22,6 +24,7 @@ final class LocalChapterStorage {
     private var translatedChapterIds: Set<String> = []
     private var driveSyncedChapterIds: Set<String> = []
     private var customChapterTitles: [String: String] = [:]
+    private let coverMemoryCache = NSCache<NSString, UIImage>()
     private let queue = DispatchQueue(label: "com.anhhai.doctruyen.storage", attributes: .concurrent)
 
     private init() {
@@ -29,15 +32,17 @@ final class LocalChapterStorage {
         chaptersDirectory = docs.appendingPathComponent("ChaptersStorage", isDirectory: true)
         originalChaptersDirectory = docs.appendingPathComponent("OriginalChaptersStorage", isDirectory: true)
         foldersCacheDirectory = docs.appendingPathComponent("FoldersDiskCache", isDirectory: true)
+        coversCacheDirectory = docs.appendingPathComponent("CoversDiskCache", isDirectory: true)
         metadataFileURL = docs.appendingPathComponent("TranslatedChaptersMeta.json")
         driveSyncedFileURL = docs.appendingPathComponent("DriveSyncedChaptersMeta.json")
         customTitlesFileURL = docs.appendingPathComponent("CustomChapterTitlesMeta.json")
 
-        for dir in [chaptersDirectory, originalChaptersDirectory, foldersCacheDirectory] {
+        for dir in [chaptersDirectory, originalChaptersDirectory, foldersCacheDirectory, coversCacheDirectory] {
             if !fileManager.fileExists(atPath: dir.path) {
                 try? fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
             }
         }
+        coverMemoryCache.countLimit = 120
         loadMetadata()
     }
 
@@ -75,7 +80,54 @@ final class LocalChapterStorage {
         return safe.isEmpty ? "default_root" : safe
     }
 
-    // MARK: - Custom Chapter Titles (Đổi tên chương sau khi dịch)
+    // MARK: - Story Folder Cover Image Cache (Lưu ảnh đại diện của từng bộ truyện trên máy)
+    private func coverFileURL(for folderId: String) -> URL {
+        let fileName = "\(sanitizedIdentifier(folderId)).jpg"
+        return coversCacheDirectory.appendingPathComponent(fileName)
+    }
+
+    func hasCachedCoverImage(for folderId: String) -> Bool {
+        let key = folderId as NSString
+        if coverMemoryCache.object(forKey: key) != nil {
+            return true
+        }
+        return fileManager.fileExists(atPath: coverFileURL(for: folderId).path)
+    }
+
+    func loadCachedCoverImage(for folderId: String) -> UIImage? {
+        let key = folderId as NSString
+        if let mem = coverMemoryCache.object(forKey: key) {
+            return mem
+        }
+        let url = coverFileURL(for: folderId)
+        guard fileManager.fileExists(atPath: url.path),
+              let data = try? Data(contentsOf: url),
+              let img = UIImage(data: data) else {
+            return nil
+        }
+        coverMemoryCache.setObject(img, forKey: key)
+        return img
+    }
+
+    func saveCachedCoverImageData(_ data: Data, for folderId: String) -> UIImage? {
+        guard let image = UIImage(data: data) else { return nil }
+        let key = folderId as NSString
+        coverMemoryCache.setObject(image, forKey: key)
+        let url = coverFileURL(for: folderId)
+        let jpegData = image.jpegData(compressionQuality: 0.86) ?? data
+        try? jpegData.write(to: url, options: .atomic)
+        return image
+    }
+
+    func clearCoverCache() {
+        coverMemoryCache.removeAllObjects()
+        queue.sync(flags: .barrier) {
+            try? self.fileManager.removeItem(at: self.coversCacheDirectory)
+            try? self.fileManager.createDirectory(at: self.coversCacheDirectory, withIntermediateDirectories: true)
+        }
+    }
+
+    // MARK: - Custom Chapter Titles
     func customTitle(for chapterId: String) -> String? {
         queue.sync {
             customChapterTitles[chapterId]
@@ -93,7 +145,7 @@ final class LocalChapterStorage {
         }
     }
 
-    // MARK: - Chapter Content Disk Storage (Bản đang đọc / đã dịch + Bản gốc dự phòng)
+    // MARK: - Chapter Content Disk Storage
     func fileURL(for chapterId: String, chapterName: String? = nil) -> URL {
         let fileName = "\(sanitizedIdentifier(chapterId)).txt"
         return chaptersDirectory.appendingPathComponent(fileName)
@@ -114,7 +166,6 @@ final class LocalChapterStorage {
         }
     }
 
-    /// Kiểm tra xem chương đã dịch này đã được ghi đè thành công lên Google Drive hay chưa
     func isChapterSyncedToDrive(_ chapterId: String) -> Bool {
         queue.sync {
             driveSyncedChapterIds.contains(chapterId)
@@ -139,7 +190,6 @@ final class LocalChapterStorage {
         return try? String(contentsOf: url, encoding: .utf8)
     }
 
-    /// Lưu bản gốc (chưa dịch) vào vùng nhớ riêng để khi cần dịch lại không bị lấy nhầm bản đã dịch
     func saveOriginalChapterIfNeeded(chapterId: String, content: String) {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -155,8 +205,6 @@ final class LocalChapterStorage {
         return try? String(contentsOf: url, encoding: .utf8)
     }
 
-    /// Ghi đè nội dung của file cũ bằng nội dung mới (hoặc nội dung đã dịch) và cập nhật tiêu đề chương nếu có.
-    /// Sử dụng queue.sync(flags: .barrier) để đảm bảo trạng thái đã dịch được cập nhật tức thì, không bao giờ bị trễ.
     func overwriteChapterFile(
         chapterId: String,
         chapterName: String? = nil,
@@ -174,7 +222,6 @@ final class LocalChapterStorage {
                 if markAsSyncedToDrive {
                     self.driveSyncedChapterIds.insert(chapterId)
                 } else {
-                    // Khi mới dịch lại chương trên máy nhưng chưa đẩy xong lên Drive thì đánh dấu chờ đồng bộ Drive
                     self.driveSyncedChapterIds.remove(chapterId)
                 }
             }
@@ -208,8 +255,6 @@ final class LocalChapterStorage {
         }
     }
 
-    /// Trả về danh sách toàn bộ các chương ĐÃ DỊCH trên máy nhưng CHƯA ĐƯỢC GHI ĐÈ lên Google Drive
-    /// (đảm bảo không bỏ sót bất kỳ chương đã dịch nào)
     func unsyncedTranslatedChapters(in chapters: [DriveItem]) -> [DriveItem] {
         queue.sync {
             chapters.filter { chap in

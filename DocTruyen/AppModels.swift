@@ -13,19 +13,22 @@ struct DriveItem: Identifiable, Codable, Equatable, Hashable {
     }
 
     var isTextFile: Bool {
-        name.lowercased().hasSuffix(".txt") || mimeType.lowercased() == "text/plain"
-    }
-
-    var isImageFile: Bool {
         let lowerName = name.lowercased()
         let lowerMime = mimeType.lowercased()
-        return lowerMime.hasPrefix("image/") ||
-            lowerName.hasSuffix(".png") ||
-            lowerName.hasSuffix(".jpg") ||
-            lowerName.hasSuffix(".jpeg") ||
-            lowerName.hasSuffix(".webp") ||
-            lowerName.hasSuffix(".gif") ||
-            lowerName.hasSuffix(".bmp")
+        if lowerName.hasSuffix(".txt") {
+            return true
+        }
+        // Chỉ coi là file chữ nếu mimeType là text/plain VÀ không có đuôi file ảnh/khác
+        if lowerMime == "text/plain" && !lowerName.contains(".") {
+            return true
+        }
+        return false
+    }
+
+    /// Trong mỗi thư mục truyện chỉ có các file chương (.txt) và 1 file ảnh đại diện với tên và đuôi bất kỳ:
+    /// Bất kỳ file nào không phải thư mục và không phải file .txt đều được nhận diện làm ảnh bìa của truyện.
+    var isImageFile: Bool {
+        !isFolder && !isTextFile
     }
 
     var cleanChapterName: String {
@@ -94,7 +97,6 @@ enum GeminiModelChoice: String, CaseIterable, Identifiable, Codable {
         }
     }
 
-    /// Chỉ sử dụng các endpoint thực tế hoạt động trên Google AI Studio để không bị lỗi 404 làm chậm/ngắt luồng dịch
     var candidateEndpointModels: [String] {
         switch self {
         case .flash35Lite:
@@ -143,8 +145,6 @@ Nhiệm vụ của bạn là biên tập và viết lại (cover/dịch mượt)
 }
 
 enum ChapterTitleExtractor {
-    /// Quét trong vài dòng đầu của nội dung chương (tối đa 10 dòng không rỗng đầu tiên),
-    /// dòng nào bắt đầu bằng chữ "Chương" thì lấy nguyên câu đó làm tên chương.
     static func extractUpdatedChapterTitle(
         rawFileName: String,
         storyTitle: String,
@@ -166,7 +166,6 @@ enum ChapterTitleExtractor {
         for line in topLines {
             let folded = line.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "vi_VN"))
             if folded.hasPrefix("chuong ") || folded.hasPrefix("chuong:") || folded.hasPrefix("chuong\t") {
-                // Loại bỏ các ký tự không hợp lệ trong tên file trên Google Drive
                 let safeTitle = line
                     .replacingOccurrences(of: "/", with: " - ")
                     .replacingOccurrences(of: "\\", with: " - ")
