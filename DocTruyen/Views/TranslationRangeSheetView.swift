@@ -107,7 +107,6 @@ struct TranslationRangeSheetView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 14))
                         }
 
-                        // Thống kê rõ ràng bao nhiêu chương đã dịch / chưa dịch trong khoảng đang chọn
                         HStack(spacing: 10) {
                             Label("Tổng: \(selectedChaptersSlice.count) chương", systemImage: "books.vertical.fill")
                                 .font(.caption.weight(.semibold))
@@ -146,7 +145,7 @@ struct TranslationRangeSheetView: View {
                         }
                         .pickerStyle(.segmented)
 
-                        Toggle("Tự chuyển sang 3.1 Flash Lite nếu hết quota", isOn: $viewModel.autoSwitchTo31OnQuota)
+                        Toggle("Tự chuyển sang 3.1 Flash Lite nếu hết quota / quá tải", isOn: $viewModel.autoSwitchTo31OnQuota)
                             .font(.caption)
 
                         if viewModel.geminiApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -376,7 +375,7 @@ struct TranslationRangeSheetView: View {
     }
 }
 
-// MARK: - Danh sách chọn chương có tìm kiếm, tự cuộn tới vị trí đang chọn và hiện rõ huy hiệu [Đã dịch] / [Chưa dịch]
+// MARK: - Danh sách chọn chương: Tự động cuộn ngay lên đầu danh sách khi bật "Chỉ hiện các chương chưa dịch"
 private struct ChapterSelectionListModal: View {
     let title: String
     let chapters: [DriveItem]
@@ -386,6 +385,7 @@ private struct ChapterSelectionListModal: View {
     @Environment(\.dismiss) private var dismiss
     @State private var searchText: String = ""
     @State private var filterUntranslatedOnly: Bool = false
+    @State private var listResetToken: Int = 0
 
     private var filteredItems: [(index: Int, chapter: DriveItem, isTranslated: Bool)] {
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -437,60 +437,95 @@ private struct ChapterSelectionListModal: View {
                 Divider()
 
                 ScrollViewReader { proxy in
-                    List {
-                        ForEach(filteredItems, id: \.chapter.id) { item in
-                            let isCurrentSelected = (item.index == selectedIndex)
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            Color.clear
+                                .frame(height: 1)
+                                .id("PICKER_TOP_ANCHOR")
 
-                            Button {
-                                onSelect(item.index)
-                                dismiss()
-                            } label: {
-                                HStack(spacing: 10) {
-                                    Text("\(item.index + 1)")
-                                        .font(.caption.weight(.bold))
-                                        .frame(width: 34, height: 34)
-                                        .background(isCurrentSelected ? Color.accentColor : Color(.secondarySystemBackground))
-                                        .foregroundStyle(isCurrentSelected ? .white : .primary)
-                                        .clipShape(Circle())
+                            ForEach(filteredItems, id: \.chapter.id) { item in
+                                let isCurrentSelected = (item.index == selectedIndex)
 
-                                    Text(item.chapter.cleanChapterName)
-                                        .font(.subheadline.weight(isCurrentSelected ? .bold : .regular))
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(2)
+                                Button {
+                                    onSelect(item.index)
+                                    dismiss()
+                                } label: {
+                                    HStack(spacing: 10) {
+                                        Text("\(item.index + 1)")
+                                            .font(.caption.weight(.bold))
+                                            .frame(width: 34, height: 34)
+                                            .background(isCurrentSelected ? Color.accentColor : Color(.secondarySystemBackground))
+                                            .foregroundStyle(isCurrentSelected ? .white : .primary)
+                                            .clipShape(Circle())
 
-                                    Spacer()
+                                        Text(item.chapter.cleanChapterName)
+                                            .font(.subheadline.weight(isCurrentSelected ? .bold : .regular))
+                                            .foregroundStyle(.primary)
+                                            .multilineTextAlignment(.leading)
+                                            .lineLimit(2)
 
-                                    if item.isTranslated {
-                                        HStack(spacing: 3) {
-                                            Image(systemName: "checkmark.seal.fill")
-                                            Text("Đã dịch")
-                                        }
-                                        .font(.system(size: 11, weight: .bold))
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 4)
-                                        .background(Color.green.opacity(0.16))
-                                        .foregroundStyle(Color.green)
-                                        .clipShape(Capsule())
-                                    } else {
-                                        Text("Chưa dịch")
-                                            .font(.system(size: 11, weight: .medium))
+                                        Spacer()
+
+                                        if item.isTranslated {
+                                            HStack(spacing: 3) {
+                                                Image(systemName: "checkmark.seal.fill")
+                                                Text("Đã dịch")
+                                            }
+                                            .font(.system(size: 11, weight: .bold))
                                             .padding(.horizontal, 8)
                                             .padding(.vertical, 4)
-                                            .background(Color.secondary.opacity(0.12))
-                                            .foregroundStyle(.secondary)
+                                            .background(Color.green.opacity(0.16))
+                                            .foregroundStyle(Color.green)
                                             .clipShape(Capsule())
+                                        } else {
+                                            Text("Chưa dịch")
+                                                .font(.system(size: 11, weight: .medium))
+                                                .padding(.horizontal, 8)
+                                                .padding(.vertical, 4)
+                                                .background(Color.secondary.opacity(0.12))
+                                                .foregroundStyle(.secondary)
+                                                .clipShape(Capsule())
+                                        }
                                     }
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 10)
+                                    .background(isCurrentSelected ? Color.accentColor.opacity(0.08) : Color.clear)
                                 }
-                                .padding(.vertical, 2)
+                                .buttonStyle(.plain)
+                                .id(item.index)
+
+                                Divider()
+                                    .padding(.leading, 58)
                             }
-                            .id(item.index)
                         }
                     }
-                    .listStyle(.plain)
+                    .id("CHAPTER_PICKER_SCROLL_\(filterUntranslatedOnly)_\(listResetToken)")
                     .onAppear {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            proxy.scrollTo(selectedIndex, anchor: .center)
+                            if filterUntranslatedOnly {
+                                proxy.scrollTo("PICKER_TOP_ANCHOR", anchor: .top)
+                            } else {
+                                proxy.scrollTo(selectedIndex, anchor: .center)
+                            }
                         }
+                    }
+                    .onChange(of: filterUntranslatedOnly) { isFilteringUntranslated in
+                        listResetToken += 1
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            if isFilteringUntranslated {
+                                // Khi bật "Chỉ hiện các chương chưa dịch": tự động nhảy tới chương chưa dịch tiếp theo gần chương đang chọn nhất (hoặc đầu danh sách)
+                                if let nextUntranslated = filteredItems.first(where: { $0.index >= selectedIndex }) {
+                                    proxy.scrollTo(nextUntranslated.index, anchor: .top)
+                                } else {
+                                    proxy.scrollTo("PICKER_TOP_ANCHOR", anchor: .top)
+                                }
+                            } else {
+                                proxy.scrollTo(selectedIndex, anchor: .center)
+                            }
+                        }
+                    }
+                    .onChange(of: searchText) { _ in
+                        proxy.scrollTo("PICKER_TOP_ANCHOR", anchor: .top)
                     }
                 }
             }
