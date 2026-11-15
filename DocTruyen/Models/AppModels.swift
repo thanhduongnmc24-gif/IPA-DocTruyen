@@ -13,7 +13,7 @@ struct DriveItem: Identifiable, Codable, Equatable, Hashable {
     }
 
     var isTextFile: Bool {
-        name.lowercased().hasSuffix(".txt")
+        name.lowercased().hasSuffix(".txt") || mimeType.lowercased() == "text/plain"
     }
 
     var isImageFile: Bool {
@@ -79,7 +79,7 @@ enum GeminiModelChoice: String, CaseIterable, Identifiable, Codable {
     var displayName: String {
         switch self {
         case .flash35Lite:
-            return "Gemini 3.5 Flash Lite (Ưu tiên)"
+            return "Gemini 2.5 / 3.5 Flash Lite (Ưu tiên)"
         case .flash31Lite:
             return "Gemini 3.1 Flash Lite (Dự phòng Quota)"
         }
@@ -88,24 +88,25 @@ enum GeminiModelChoice: String, CaseIterable, Identifiable, Codable {
     var shortBadge: String {
         switch self {
         case .flash35Lite:
-            return "3.5 Flash Lite"
+            return "Flash Lite (Chính)"
         case .flash31Lite:
             return "3.1 Flash Lite"
         }
     }
 
+    /// Chỉ sử dụng các endpoint thực tế hoạt động trên Google AI Studio để không bị lỗi 404 làm chậm/ngắt luồng dịch
     var candidateEndpointModels: [String] {
         switch self {
         case .flash35Lite:
             return [
-                "gemini-3.5-flash-lite",
-                "gemini-3.5-flash-lite-preview",
-                "gemini-2.5-flash-lite"
+                "gemini-2.5-flash-lite",
+                "gemini-2.5-flash",
+                "gemini-2.0-flash"
             ]
         case .flash31Lite:
             return [
-                "gemini-3.1-flash-lite",
                 "gemini-3.1-flash-lite-preview",
+                "gemini-2.5-flash-lite",
                 "gemini-2.0-flash-lite"
             ]
         }
@@ -152,7 +153,6 @@ enum ChapterTitleExtractor {
         let nonEmptyLines = chapterContent.components(separatedBy: .newlines)
             .map { line -> String in
                 var s = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                // Bỏ các ký hiệu markdown đầu dòng như ###, **, *, - nếu có
                 if let r = s.range(of: #"^[#*>\-\s]+"#, options: .regularExpression) {
                     s.removeSubrange(r)
                 }
@@ -161,14 +161,19 @@ enum ChapterTitleExtractor {
             }
             .filter { !$0.isEmpty }
 
-        // Kiểm tra trong 10 dòng đầu tiên
         let topLines = nonEmptyLines.prefix(10)
 
         for line in topLines {
             let folded = line.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "vi_VN"))
-            // Nếu dòng bắt đầu bằng "Chương" (hoặc "Chuong") thì lấy nguyên câu đó làm tên chương
             if folded.hasPrefix("chuong ") || folded.hasPrefix("chuong:") || folded.hasPrefix("chuong\t") {
-                return line
+                // Loại bỏ các ký tự không hợp lệ trong tên file trên Google Drive
+                let safeTitle = line
+                    .replacingOccurrences(of: "/", with: " - ")
+                    .replacingOccurrences(of: "\\", with: " - ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !safeTitle.isEmpty {
+                    return safeTitle
+                }
             }
         }
 
