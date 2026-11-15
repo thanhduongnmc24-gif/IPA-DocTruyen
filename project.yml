@@ -27,6 +27,10 @@ targets:
       - path: DocTruyen
         excludes:
           - Info.plist
+          - Models
+          - Services
+          - ViewModels
+          - Views
     info:
       path: DocTruyen/Info.plist
       properties:
@@ -37,8 +41,8 @@ targets:
         CFBundleInfoDictionaryVersion: "6.0"
         CFBundleName: "$(PRODUCT_NAME)"
         CFBundlePackageType: "$(PRODUCT_BUNDLE_PACKAGE_TYPE)"
-        CFBundleShortVersionString: "2.2.1"
-        CFBundleVersion: "4"
+        CFBundleShortVersionString: "2.3.0"
+        CFBundleVersion: "5"
         GoogleDriveAPIKey: "__GOOGLE_DRIVE_API_KEY__"
         GoogleDriveFolderID: "__GOOGLE_DRIVE_FOLDER_ID__"
         LSRequiresIPhoneOS: true
