@@ -38,6 +38,8 @@ final class AppViewModel: ObservableObject {
 
     /// Tăng mỗi khi chuyển sang chương mới để ép ScrollView tạo mới và cuộn về đầu trang (y = 0)
     @Published var readerScrollResetToken: Int = 0
+    /// Tăng mỗi khi chuyển cụm chương trong Mục lục để ép danh sách mục lục cuộn lên đầu trang
+    @Published var tocScrollResetToken: Int = 0
 
     @Published var isLoading: Bool = false
     @Published var errorMessage: String = ""
@@ -93,7 +95,7 @@ final class AppViewModel: ObservableObject {
     @Published var translationStatusNote: String = ""
     @Published var translatedRevisionTrigger: Int = 0
 
-    // MARK: - In-Memory Caches (kết hợp cùng Disk Cache trong LocalChapterStorage)
+    // MARK: - In-Memory Caches
     private var folderCache: [String: (mode: ScreenMode, folders: [DriveItem], chapters: [DriveItem])] = [:]
     private var chapterContentCache: [String: String] = [:]
     private var prefetchingIds: Set<String> = []
@@ -268,7 +270,7 @@ final class AppViewModel: ObservableObject {
             folderId: storyFolderId,
             folderStack: folderStack,
             chapterId: chapter.id,
-            chapterName: chapter.name,
+            chapterName: chapter.cleanChapterName,
             paragraphIndex: paragraphIndex,
             savedAt: Date().timeIntervalSince1970
         )
@@ -286,7 +288,6 @@ final class AppViewModel: ObservableObject {
         readingStates = saved.states
         lastReadingFolderId = saved.lastReadingFolderId
 
-        // Khôi phục ngay lập tức chương đang đọc từ bộ nhớ đệm trên máy mà không cần gọi lại Google Drive
         if let lastId = saved.lastReadingFolderId,
            let lastState = saved.states[lastId],
            let lastFolder = lastState.folderStack.last,
@@ -567,11 +568,11 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    // MARK: - TOC Pagination
+    // MARK: - TOC Pagination (Tự động cuộn về đầu trang mỗi khi chuyển cụm chương)
     private func computeTocStart(for index: Int) -> Int {
         guard index >= 0 else { return 0 }
-        let maxStart = max(chapters.count - tocWindowSize, 0)
-        return max(0, min(index - 3, maxStart))
+        let pageIndex = index / tocWindowSize
+        return pageIndex * tocWindowSize
     }
 
     func openTableOfContents() {
@@ -579,19 +580,22 @@ final class AppViewModel: ObservableObject {
             ? currentChapterIndex
             : (chapters.firstIndex(where: { $0.id == currentStorySavedState?.chapterId }) ?? 0)
         tocStartIndex = computeTocStart(for: idx)
+        tocScrollResetToken += 1
         tocVisible = true
     }
 
     func nextTocPage() {
         let maxStart = max(chapters.count - tocWindowSize, 0)
         tocStartIndex = min(tocStartIndex + tocWindowSize, maxStart)
+        tocScrollResetToken += 1
     }
 
     func prevTocPage() {
         tocStartIndex = max(tocStartIndex - tocWindowSize, 0)
+        tocScrollResetToken += 1
     }
 
-    // MARK: - Gemini Translation Popup & Batch Overwrite
+    // MARK: - Gemini Translation Popup & Batch Overwrite (Tự động cập nhật tên chương nếu trùng tên truyện)
     func prepareAndOpenTranslationPopup() {
         guard !chapters.isEmpty else {
             showToast("Không có chương nào để dịch.")
@@ -626,6 +630,7 @@ final class AppViewModel: ObservableObject {
         translationTotalCount = targetSlice.count
         translationProgressCount = 0
         translationStatusNote = "Đang khởi tạo tiến trình dịch..."
+        let currentStoryTitle = currentFolder.name
 
         translationTask = Task {
             var successCount = 0
@@ -653,14 +658,32 @@ final class AppViewModel: ObservableObject {
                         switchedModelNotice = " (Đã tự động chuyển sang \(outcome.usedModelChoice.shortBadge) do hết quota)"
                     }
 
+                    // Kiểm tra nếu tên chương trùng với tên truyện (VD: "1000 Cửu Vực Phàm Tiên")
+                    // thì tự động đổi tên chương theo dòng đầu tiên sau chữ "Chương X:" trong nội dung đã dịch
+                    let extractedNewTitle = ChapterTitleExtractor.extractUpdatedChapterTitle(
+                        rawFileName: chapter.name,
+                        storyTitle: currentStoryTitle,
+                        chapterContent: outcome.translatedText
+                    )
+
                     try LocalChapterStorage.shared.overwriteChapterFile(
                         chapterId: chapter.id,
                         chapterName: chapter.name,
                         content: outcome.translatedText,
-                        markAsTranslated: true
+                        markAsTranslated: true,
+                        updatedChapterTitle: extractedNewTitle
                     )
 
                     chapterContentCache[chapter.id] = outcome.translatedText
+
+                    if let newTitle = extractedNewTitle {
+                        if let globalIdx = chapters.firstIndex(where: { $0.id == chapter.id }) {
+                            chapters[globalIdx].name = "\(newTitle).txt"
+                        }
+                        if selectedChapter?.id == chapter.id {
+                            selectedChapter?.name = "\(newTitle).txt"
+                        }
+                    }
 
                     if selectedChapter?.id == chapter.id {
                         chapterContent = outcome.translatedText
@@ -681,6 +704,17 @@ final class AppViewModel: ObservableObject {
                     isTranslatingBatch = false
                     return
                 }
+            }
+
+            // Lưu lại danh sách chương đã cập nhật tên mới xuống bộ nhớ đệm trên máy
+            if !chapters.isEmpty {
+                folderCache[currentFolder.id] = (.chapters, [], chapters)
+                LocalChapterStorage.shared.saveFolderSnapshotToDisk(
+                    folderId: currentFolder.id,
+                    isChaptersMode: true,
+                    folders: [],
+                    chapters: chapters
+                )
             }
 
             isTranslatingBatch = false
