@@ -20,7 +20,11 @@ struct TranslationRangeSheetView: View {
         let alreadyTranslatedCount = selectedChaptersSlice.filter {
             LocalChapterStorage.shared.isChapterTranslated($0.id)
         }.count
+        let driveSyncedInSliceCount = selectedChaptersSlice.filter {
+            LocalChapterStorage.shared.isChapterSyncedToDrive($0.id)
+        }.count
         let untranslatedCount = max(0, selectedChaptersSlice.count - alreadyTranslatedCount)
+        let totalUnsyncedInStory = LocalChapterStorage.shared.unsyncedTranslatedChapters(in: viewModel.chapters).count
 
         NavigationStack {
             ScrollView {
@@ -41,9 +45,9 @@ struct TranslationRangeSheetView: View {
                         }
 
                         VStack(alignment: .leading, spacing: 3) {
-                            Text("Dịch & Biên tập lại truyện")
+                            Text("Dịch & Ghi đè Google Drive (Chạy ngầm)")
                                 .font(.subheadline.weight(.bold))
-                            Text("Chương đã dịch có dấu ✅ Đã dịch rõ ràng để bạn dễ chọn.")
+                            Text("Bạn có thể đóng bảng này để đọc truyện tiếp trong lúc app đang dịch và ghi đè lên Drive.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -53,9 +57,50 @@ struct TranslationRangeSheetView: View {
                     .background(Color(.secondarySystemBackground))
                     .clipShape(RoundedRectangle(cornerRadius: 14))
 
+                    // Nếu có chương đã dịch trên máy nhưng chưa được ghi đè lên Drive -> Hiện nút đẩy bù ngay lập tức
+                    if totalUnsyncedInStory > 0 && viewModel.isCloudOverwriteConfigured {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "exclamationmark.icloud.fill")
+                                    .foregroundStyle(.orange)
+                                Text("Phát hiện \(totalUnsyncedInStory) chương đã dịch nhưng chưa ghi đè lên Drive")
+                                    .font(.caption.weight(.bold))
+                            }
+
+                            Button {
+                                Task {
+                                    await viewModel.syncAllTranslatedChaptersToDrive(onlyUnsynced: true)
+                                }
+                            } label: {
+                                HStack {
+                                    if viewModel.isSyncingToDrive {
+                                        ProgressView()
+                                            .tint(.white)
+                                            .padding(.trailing, 4)
+                                    } else {
+                                        Image(systemName: "icloud.and.arrow.up.fill")
+                                    }
+                                    Text(viewModel.isSyncingToDrive
+                                         ? "Đang ghi đè ngầm (\(viewModel.driveSyncProgressCount)/\(viewModel.driveSyncTotalCount))..."
+                                         : "Ghi đè bù ngay \(totalUnsyncedInStory) chương đã dịch lên Drive")
+                                        .font(.caption.weight(.bold))
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 10)
+                                .background(Color.blue)
+                                .foregroundStyle(.white)
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+                            }
+                            .disabled(viewModel.isSyncingToDrive)
+                        }
+                        .padding(12)
+                        .background(Color.orange.opacity(0.12))
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                    }
+
                     // Range Picker Section
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Chọn phạm vi chương cần dịch")
+                        Text("Chọn phạm vi chương cần dịch & ghi đè")
                             .font(.subheadline.weight(.bold))
 
                         ScrollView(.horizontal, showsIndicators: false) {
@@ -76,6 +121,12 @@ struct TranslationRangeSheetView: View {
                                     let idx = max(0, viewModel.currentChapterIndex)
                                     viewModel.translateFromChapterIndex = idx
                                     viewModel.translateToChapterIndex = min(viewModel.chapters.count - 1, idx + 9)
+                                }
+
+                                quickRangeButton("20 chương tiếp") {
+                                    let idx = max(0, viewModel.currentChapterIndex)
+                                    viewModel.translateFromChapterIndex = idx
+                                    viewModel.translateToChapterIndex = min(viewModel.chapters.count - 1, idx + 19)
                                 }
 
                                 quickRangeButton("Tìm 5 chương chưa dịch") {
@@ -107,35 +158,43 @@ struct TranslationRangeSheetView: View {
                             .clipShape(RoundedRectangle(cornerRadius: 14))
                         }
 
-                        HStack(spacing: 10) {
-                            Label("Tổng: \(selectedChaptersSlice.count) chương", systemImage: "books.vertical.fill")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.primary)
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                Label("Tổng: \(selectedChaptersSlice.count) chương", systemImage: "books.vertical.fill")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.primary)
 
-                            Spacer()
+                                Text("✅ Đã dịch: \(alreadyTranslatedCount)")
+                                    .font(.caption2.weight(.bold))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Color.green.opacity(0.16))
+                                    .foregroundStyle(Color.green)
+                                    .clipShape(Capsule())
 
-                            Text("✅ Đã dịch: \(alreadyTranslatedCount)")
-                                .font(.caption2.weight(.bold))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color.green.opacity(0.16))
-                                .foregroundStyle(Color.green)
-                                .clipShape(Capsule())
+                                Text("☁️ Đã lên Drive: \(driveSyncedInSliceCount)")
+                                    .font(.caption2.weight(.bold))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Color.blue.opacity(0.16))
+                                    .foregroundStyle(Color.blue)
+                                    .clipShape(Capsule())
 
-                            Text("⏳ Chưa dịch: \(untranslatedCount)")
-                                .font(.caption2.weight(.bold))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color.orange.opacity(0.16))
-                                .foregroundStyle(Color.orange)
-                                .clipShape(Capsule())
+                                Text("⏳ Chưa dịch: \(untranslatedCount)")
+                                    .font(.caption2.weight(.bold))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .background(Color.orange.opacity(0.16))
+                                    .foregroundStyle(Color.orange)
+                                    .clipShape(Capsule())
+                            }
                         }
                         .padding(.top, 2)
                     }
 
                     // Model & API Key Quick Config
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Model AI & Khóa kết nối")
+                        Text("Model AI & Chế độ ghi đè")
                             .font(.subheadline.weight(.bold))
 
                         Picker("Chọn Model", selection: $viewModel.selectedGeminiModel) {
@@ -145,7 +204,10 @@ struct TranslationRangeSheetView: View {
                         }
                         .pickerStyle(.segmented)
 
-                        Toggle("Tự chuyển sang 3.1 Flash Lite nếu hết quota / quá tải", isOn: $viewModel.autoSwitchTo31OnQuota)
+                        Toggle("Tự chuyển sang 3.1 Flash Lite & tự chờ hồi Quota khi quá tải", isOn: $viewModel.autoSwitchTo31OnQuota)
+                            .font(.caption)
+
+                        Toggle("Không dịch lại chương đã dịch (chỉ đẩy bù lên Drive nếu thiếu)", isOn: $viewModel.skipAlreadyTranslatedInBatch)
                             .font(.caption)
 
                         if viewModel.geminiApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -215,6 +277,21 @@ struct TranslationRangeSheetView: View {
                     // Action Buttons
                     VStack(spacing: 10) {
                         if viewModel.isTranslatingBatch {
+                            Button {
+                                dismiss()
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "book.fill")
+                                    Text("Ẩn bảng này để đọc truyện tiếp (Vẫn dịch & ghi đè ngầm)")
+                                        .font(.subheadline.weight(.bold))
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 13)
+                                .background(Color.accentColor)
+                                .foregroundStyle(.white)
+                                .clipShape(RoundedRectangle(cornerRadius: 14))
+                            }
+
                             Button(role: .destructive) {
                                 viewModel.cancelBatchTranslation()
                             } label: {
@@ -222,11 +299,11 @@ struct TranslationRangeSheetView: View {
                                     ProgressView()
                                         .tint(.white)
                                         .padding(.trailing, 6)
-                                    Text("Dừng dịch")
+                                    Text("Dừng tiến trình dịch")
                                         .fontWeight(.bold)
                                 }
                                 .frame(maxWidth: .infinity)
-                                .padding(.vertical, 14)
+                                .padding(.vertical, 13)
                                 .background(Color.red)
                                 .foregroundStyle(.white)
                                 .clipShape(RoundedRectangle(cornerRadius: 14))
@@ -276,7 +353,7 @@ struct TranslationRangeSheetView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Đóng") {
+                    Button(viewModel.isTranslatingBatch ? "Đọc tiếp" : "Đóng") {
                         dismiss()
                     }
                 }
@@ -320,6 +397,7 @@ struct TranslationRangeSheetView: View {
         let safeIdx = max(0, min(selectedIndex, max(viewModel.chapters.count - 1, 0)))
         let chapter = viewModel.chapters.isEmpty ? nil : viewModel.chapters[safeIdx]
         let isTranslated = chapter.map { LocalChapterStorage.shared.isChapterTranslated($0.id) } ?? false
+        let isDriveSynced = chapter.map { LocalChapterStorage.shared.isChapterSyncedToDrive($0.id) } ?? false
 
         Button(action: onTap) {
             HStack(spacing: 10) {
@@ -335,13 +413,15 @@ struct TranslationRangeSheetView: View {
                             .foregroundStyle(.primary)
                             .lineLimit(1)
 
-                        HStack(spacing: 4) {
+                        HStack(spacing: 6) {
                             Image(systemName: isTranslated ? "checkmark.seal.fill" : "clock")
                                 .font(.system(size: 10, weight: .bold))
-                            Text(isTranslated ? "Đã dịch AI" : "Chưa dịch (Bản gốc)")
+                            Text(isDriveSynced
+                                 ? "Đã dịch & ghi đè Drive"
+                                 : (isTranslated ? "Đã dịch trên máy (Chờ lên Drive)" : "Chưa dịch (Bản gốc)"))
                                 .font(.system(size: 11, weight: .semibold))
                         }
-                        .foregroundStyle(isTranslated ? Color.green : Color.orange)
+                        .foregroundStyle(isDriveSynced ? Color.blue : (isTranslated ? Color.green : Color.orange))
                     }
                 }
 
@@ -375,7 +455,6 @@ struct TranslationRangeSheetView: View {
     }
 }
 
-// MARK: - Danh sách chọn chương: Tự động cuộn ngay lên đầu danh sách khi bật "Chỉ hiện các chương chưa dịch"
 private struct ChapterSelectionListModal: View {
     let title: String
     let chapters: [DriveItem]
@@ -387,10 +466,11 @@ private struct ChapterSelectionListModal: View {
     @State private var filterUntranslatedOnly: Bool = false
     @State private var listResetToken: Int = 0
 
-    private var filteredItems: [(index: Int, chapter: DriveItem, isTranslated: Bool)] {
+    private var filteredItems: [(index: Int, chapter: DriveItem, isTranslated: Bool, isSynced: Bool)] {
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return chapters.enumerated().compactMap { idx, chap in
             let translated = LocalChapterStorage.shared.isChapterTranslated(chap.id)
+            let synced = LocalChapterStorage.shared.isChapterSyncedToDrive(chap.id)
             if filterUntranslatedOnly && translated {
                 return nil
             }
@@ -401,7 +481,7 @@ private struct ChapterSelectionListModal: View {
                     return nil
                 }
             }
-            return (idx, chap, translated)
+            return (idx, chap, translated, synced)
         }
     }
 
@@ -466,12 +546,23 @@ private struct ChapterSelectionListModal: View {
 
                                         Spacer()
 
-                                        if item.isTranslated {
+                                        if item.isSynced {
+                                            HStack(spacing: 3) {
+                                                Image(systemName: "icloud.fill")
+                                                Text("Đã lên Drive")
+                                            }
+                                            .font(.system(size: 10, weight: .bold))
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 4)
+                                            .background(Color.blue.opacity(0.16))
+                                            .foregroundStyle(Color.blue)
+                                            .clipShape(Capsule())
+                                        } else if item.isTranslated {
                                             HStack(spacing: 3) {
                                                 Image(systemName: "checkmark.seal.fill")
                                                 Text("Đã dịch")
                                             }
-                                            .font(.system(size: 11, weight: .bold))
+                                            .font(.system(size: 10, weight: .bold))
                                             .padding(.horizontal, 8)
                                             .padding(.vertical, 4)
                                             .background(Color.green.opacity(0.16))
@@ -513,7 +604,6 @@ private struct ChapterSelectionListModal: View {
                         listResetToken += 1
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                             if isFilteringUntranslated {
-                                // Khi bật "Chỉ hiện các chương chưa dịch": tự động nhảy tới chương chưa dịch tiếp theo gần chương đang chọn nhất (hoặc đầu danh sách)
                                 if let nextUntranslated = filteredItems.first(where: { $0.index >= selectedIndex }) {
                                     proxy.scrollTo(nextUntranslated.index, anchor: .top)
                                 } else {

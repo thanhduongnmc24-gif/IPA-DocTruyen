@@ -13,6 +13,11 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 headerBar(palette: palette)
 
+                // Thanh trạng thái nhỏ gọn khi đang dịch hoặc ghi đè ngầm lên Google Drive (không chặn việc đọc truyện)
+                if viewModel.isTranslatingBatch || viewModel.isSyncingToDrive {
+                    backgroundSyncBanner(palette: palette)
+                }
+
                 if !viewModel.errorMessage.isEmpty {
                     errorBanner
                 }
@@ -49,13 +54,59 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Top Navigation Header (Thu gọn tối đa khi đọc truyện để nhường chỗ cho nội dung)
+    // MARK: - Thanh tiến trình chạy ngầm (Vừa dịch/ghi đè Drive vừa đọc truyện thoải mái)
+    @ViewBuilder
+    private func backgroundSyncBanner(palette: ThemePalette) -> some View {
+        Button {
+            if viewModel.isTranslatingBatch {
+                viewModel.showTranslationPopup = true
+            } else {
+                viewModel.showSettingsSheet = true
+            }
+        } label: {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .scaleEffect(0.8)
+                    .tint(.orange)
+
+                Text(viewModel.isTranslatingBatch
+                     ? (viewModel.translationStatusNote.isEmpty
+                        ? "Đang dịch & ghi đè (\(viewModel.translationProgressCount)/\(viewModel.translationTotalCount))..."
+                        : viewModel.translationStatusNote)
+                     : viewModel.driveSyncStatusNote)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(palette.primaryText)
+                    .lineLimit(1)
+
+                Spacer()
+
+                Text("Xem")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(palette.accent)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(palette.cardBackground)
+            .overlay(
+                Rectangle()
+                    .fill(palette.border.opacity(0.8))
+                    .frame(height: 0.5),
+                alignment: .bottom
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Top Navigation Header
     @ViewBuilder
     private func headerBar(palette: ThemePalette) -> some View {
         if viewModel.screenMode == .reader {
             let _ = viewModel.translatedRevisionTrigger
             let isTranslated = viewModel.selectedChapter.map {
                 LocalChapterStorage.shared.isChapterTranslated($0.id)
+            } ?? false
+            let isSyncedToDrive = viewModel.selectedChapter.map {
+                LocalChapterStorage.shared.isChapterSyncedToDrive($0.id)
             } ?? false
 
             HStack(spacing: 6) {
@@ -71,7 +122,11 @@ struct ContentView: View {
                 }
 
                 HStack(spacing: 4) {
-                    if isTranslated {
+                    if isSyncedToDrive {
+                        Image(systemName: "icloud.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.blue)
+                    } else if isTranslated {
                         Image(systemName: "checkmark.seal.fill")
                             .font(.system(size: 11))
                             .foregroundStyle(.green)
@@ -95,9 +150,12 @@ struct ContentView: View {
                     HStack(spacing: 3) {
                         Image(systemName: "sparkles")
                             .font(.system(size: 10, weight: .bold))
-                        Text("Dịch")
+                        Text(viewModel.isTranslatingBatch
+                             ? "\(viewModel.translationProgressCount)/\(viewModel.translationTotalCount)"
+                             : "Dịch")
                             .font(.system(size: 11, weight: .bold))
                     }
+                    .fixedSize(horizontal: true, vertical: false)
                     .padding(.horizontal, 9)
                     .padding(.vertical, 5)
                     .background(
@@ -143,6 +201,7 @@ struct ContentView: View {
                 alignment: .bottom
             )
         } else {
+            let _ = viewModel.translatedRevisionTrigger
             VStack(spacing: 10) {
                 HStack(spacing: 10) {
                     if viewModel.canNavigateBack {
@@ -166,7 +225,8 @@ struct ContentView: View {
 
                         if viewModel.screenMode == .chapters {
                             let translatedCount = LocalChapterStorage.shared.translatedCount(in: viewModel.chapters)
-                            Text("\(viewModel.chapters.count) chương • Đã dịch AI: \(translatedCount) chương")
+                            let syncedCount = LocalChapterStorage.shared.driveSyncedCount(in: viewModel.chapters)
+                            Text("\(viewModel.chapters.count) chương • Đã dịch: \(translatedCount) • Lên Drive: \(syncedCount)")
                                 .font(.caption)
                                 .foregroundStyle(palette.secondaryText)
                         } else {
@@ -187,6 +247,7 @@ struct ContentView: View {
                                 Text("Dịch AI")
                             }
                             .font(.caption.weight(.bold))
+                            .fixedSize(horizontal: true, vertical: false)
                             .padding(.horizontal, 11)
                             .padding(.vertical, 8)
                             .background(Color.orange)
@@ -269,7 +330,7 @@ struct ContentView: View {
                 emptyStateView(
                     icon: "books.vertical",
                     title: "Chưa có bộ truyện nào",
-                    subtitle: "Thư mục này chưa có thư mục con hoặc file .txt.",
+                    subtitle: "Hãy vuốt xuống để tải lại hoặc kiểm tra cài đặt Google Drive.",
                     palette: palette
                 )
             } else if viewModel.folderLayoutMode == .grid {
@@ -441,6 +502,7 @@ struct ContentView: View {
                     ForEach(Array(viewModel.filteredChapters.enumerated()), id: \.element.id) { idx, chapter in
                         let isActive = (viewModel.selectedChapter?.id == chapter.id) || (savedChapterId == chapter.id)
                         let isTranslated = LocalChapterStorage.shared.isChapterTranslated(chapter.id)
+                        let isSyncedToDrive = LocalChapterStorage.shared.isChapterSyncedToDrive(chapter.id)
                         let isCachedOffline = LocalChapterStorage.shared.hasLocalFile(for: chapter.id)
 
                         Button {
@@ -474,7 +536,18 @@ struct ContentView: View {
 
                                 Spacer()
 
-                                if isTranslated {
+                                if isSyncedToDrive {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "icloud.fill")
+                                        Text("Đã lên Drive")
+                                    }
+                                    .font(.system(size: 10, weight: .bold))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 5)
+                                    .background(Color.blue.opacity(0.16))
+                                    .foregroundStyle(Color.blue)
+                                    .clipShape(Capsule())
+                                } else if isTranslated {
                                     HStack(spacing: 4) {
                                         Image(systemName: "sparkles")
                                         Text("Đã dịch")
@@ -520,7 +593,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Reader View (Tối ưu không gian đọc rộng rãi, sạch sẽ, không lặp lại khối tiêu đề rườm rà)
+    // MARK: - Reader View
     @ViewBuilder
     private func readerContentView(palette: ThemePalette) -> some View {
         let _ = viewModel.translatedRevisionTrigger
@@ -540,7 +613,18 @@ struct ContentView: View {
                             .foregroundStyle(palette.secondaryText)
                             .padding(.bottom, 2)
 
-                        // Nội dung truyện chính (đã tự động làm sạch ký hiệu ### Markdown dư thừa)
+                        if viewModel.isChapterLoading {
+                            HStack(spacing: 10) {
+                                ProgressView()
+                                    .tint(palette.accent)
+                                Text("Đang tải nội dung chương...")
+                                    .font(.subheadline)
+                                    .foregroundStyle(palette.secondaryText)
+                            }
+                            .padding(.vertical, 20)
+                        }
+
+                        // Nội dung truyện chính
                         Text(cleanedStoryText)
                             .font(.system(size: viewModel.storyFontSize, weight: .regular, design: .serif))
                             .lineSpacing(viewModel.storyFontSize * 0.56)
@@ -629,7 +713,6 @@ struct ContentView: View {
         }
     }
 
-    /// Loại bỏ các dấu `### ` hoặc `**` dư thừa ở đầu dòng do AI sinh ra để trang truyện sạch đẹp
     private func formatCleanStoryBody(_ raw: String) -> String {
         let lines = raw.components(separatedBy: .newlines)
         let cleaned = lines.map { line -> String in

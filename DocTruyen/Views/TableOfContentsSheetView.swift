@@ -128,7 +128,6 @@ struct TableOfContentsSheetView: View {
                 .padding(.vertical, 10)
                 .background(palette.background)
 
-                // Danh sách chương trong cụm: Tự động tạo mới ScrollView và cuộn lên đầu trang khi bấm sang cụm chương khác
                 ScrollViewReader { scrollProxy in
                     ScrollView {
                         LazyVStack(spacing: 8) {
@@ -140,6 +139,7 @@ struct TableOfContentsSheetView: View {
                                 let globalIndex = viewModel.tocStartIndex + offset
                                 let isCurrent = viewModel.selectedChapter?.id == chapter.id
                                 let isTranslated = LocalChapterStorage.shared.isChapterTranslated(chapter.id)
+                                let isSynced = LocalChapterStorage.shared.isChapterSyncedToDrive(chapter.id)
 
                                 Button {
                                     dismiss()
@@ -163,7 +163,15 @@ struct TableOfContentsSheetView: View {
 
                                         Spacer()
 
-                                        if isTranslated {
+                                        if isSynced {
+                                            Text("Đã lên Drive")
+                                                .font(.system(size: 10, weight: .bold))
+                                                .padding(.horizontal, 8)
+                                                .padding(.vertical, 4)
+                                                .background(Color.blue.opacity(0.18))
+                                                .foregroundStyle(Color.blue)
+                                                .clipShape(Capsule())
+                                        } else if isTranslated {
                                             Text("Đã dịch AI")
                                                 .font(.system(size: 10, weight: .bold))
                                                 .padding(.horizontal, 8)
