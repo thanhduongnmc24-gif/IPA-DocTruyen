@@ -30,12 +30,34 @@ struct GeminiTranslationOutcome {
 final class GeminiService {
     static let shared = GeminiService()
     private let session: URLSession
+    private let lock = NSLock()
+    private var lastWorkingEndpointByChoice: [GeminiModelChoice: String] = [:]
 
     private init() {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 120
         config.timeoutIntervalForResource = 240
+        config.waitsForConnectivity = true
         self.session = URLSession(configuration: config)
+    }
+
+    private func prioritizedCandidates(for choice: GeminiModelChoice) -> [String] {
+        lock.lock()
+        let remembered = lastWorkingEndpointByChoice[choice]
+        lock.unlock()
+
+        var list = choice.candidateEndpointModels
+        if let remembered, let idx = list.firstIndex(of: remembered), idx > 0 {
+            list.remove(at: idx)
+            list.insert(remembered, at: 0)
+        }
+        return list
+    }
+
+    private func rememberWorkingEndpoint(_ endpoint: String, for choice: GeminiModelChoice) {
+        lock.lock()
+        lastWorkingEndpointByChoice[choice] = endpoint
+        lock.unlock()
     }
 
     func translateChapterContent(
@@ -67,56 +89,76 @@ final class GeminiService {
 
         var lastErrorMessage = "Không thể kết nối tới Gemini API."
 
-        for (choiceIndex, choice) in modelOrder.enumerated() {
-            let candidates = choice.candidateEndpointModels
+        // Hỗ trợ tự động chờ hồi hạn mức mỗi phút (RPM Cooldown) tối đa 3 vòng lớn nếu cả 2 nhánh model đều báo 429/503
+        for cooldownRound in 1...3 {
+            for (choiceIndex, choice) in modelOrder.enumerated() {
+                let candidates = prioritizedCandidates(for: choice)
 
-            for endpointModel in candidates {
-                // Thử tối đa 3 lần cho mỗi endpoint nếu máy chủ Google báo quá tải tạm thời (503 High Demand / Overloaded)
-                for attempt in 1...3 {
-                    do {
-                        let resultText = try await callGenerateContent(
-                            endpointModel: endpointModel,
-                            apiKey: cleanKey,
-                            systemInstruction: instruction,
-                            userContent: trimmedContent
-                        )
-                        return GeminiTranslationOutcome(
-                            translatedText: resultText,
-                            usedModelChoice: choice,
-                            actualEndpointModel: endpointModel,
-                            didAutoSwitchToFallback: choiceIndex > 0
-                        )
-                    } catch let err as InternalCallError {
-                        lastErrorMessage = err.message
+                for endpointModel in candidates {
+                    for attempt in 1...3 {
+                        if Task.isCancelled {
+                            throw CancellationError()
+                        }
 
-                        if err.isModelNotFound {
-                            // Model ID này không tồn tại trên endpoint -> chuyển ngay sang candidate tiếp theo
-                            break
-                        } else if err.isServerOverloaded {
-                            // Lỗi "This model is currently experiencing high demand..." (HTTP 503 / UNAVAILABLE)
-                            // Chờ 1.5s - 3s rồi thử lại, nếu vẫn quá tải thì thử sang model dự phòng tiếp theo
-                            if attempt < 2 {
-                                try? await Task.sleep(nanoseconds: UInt64(attempt) * 1_600_000_000)
+                        do {
+                            let resultText = try await callGenerateContent(
+                                endpointModel: endpointModel,
+                                apiKey: cleanKey,
+                                systemInstruction: instruction,
+                                userContent: trimmedContent
+                            )
+                            rememberWorkingEndpoint(endpointModel, for: choice)
+                            return GeminiTranslationOutcome(
+                                translatedText: resultText,
+                                usedModelChoice: choice,
+                                actualEndpointModel: endpointModel,
+                                didAutoSwitchToFallback: choiceIndex > 0
+                            )
+                        } catch is CancellationError {
+                            throw CancellationError()
+                        } catch let err as InternalCallError {
+                            lastErrorMessage = err.message
+
+                            if err.isModelNotFound {
+                                // Model ID không tồn tại trên endpoint -> chuyển ngay sang candidate tiếp theo
+                                break
+                            } else if err.isServerOverloaded {
+                                // Lỗi 503 High Demand / Overloaded -> chờ rồi thử lại
+                                if attempt < 3 {
+                                    let delayNs = UInt64(attempt) * 2_000_000_000
+                                    try? await Task.sleep(nanoseconds: delayNs)
+                                    continue
+                                } else {
+                                    break
+                                }
+                            } else if err.isQuotaExceeded {
+                                // Lỗi 429 (chạm giới hạn RPM mỗi phút) -> chờ 3s thử lại 1 lần trước khi đổi model
+                                if attempt == 1 {
+                                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                                    continue
+                                } else {
+                                    break
+                                }
+                            } else {
+                                throw GeminiServiceError.apiError(err.message)
+                            }
+                        } catch {
+                            lastErrorMessage = error.localizedDescription
+                            if attempt < 3 {
+                                try? await Task.sleep(nanoseconds: UInt64(attempt) * 1_800_000_000)
                                 continue
                             } else {
                                 break
                             }
-                        } else if err.isQuotaExceeded {
-                            // Hết quota (HTTP 429) -> thử sang model tiếp theo
-                            break
-                        } else {
-                            throw GeminiServiceError.apiError(err.message)
-                        }
-                    } catch {
-                        lastErrorMessage = error.localizedDescription
-                        if attempt < 2 {
-                            try? await Task.sleep(nanoseconds: 1_200_000_000)
-                            continue
-                        } else {
-                            break
                         }
                     }
                 }
+            }
+
+            // Nếu đã thử hết các model mà vẫn chạm giới hạn 429/503, tự động nghỉ 8s - 15s để sang phút mới rồi dịch tiếp
+            if cooldownRound < 3 && !Task.isCancelled {
+                let waitSeconds = UInt64(cooldownRound * 7)
+                try? await Task.sleep(nanoseconds: waitSeconds * 1_000_000_000)
             }
         }
 
@@ -229,7 +271,9 @@ final class GeminiService {
             )
         }
 
-        let combinedText = parts.compactMap { $0["text"] as? String }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        let combinedText = parts.compactMap { $0["text"] as? String }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !combinedText.isEmpty else {
             throw InternalCallError(
                 statusCode: 500,
