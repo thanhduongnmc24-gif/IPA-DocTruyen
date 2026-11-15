@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UIKit
 
 @MainActor
 final class AppViewModel: ObservableObject {
@@ -20,6 +21,7 @@ final class AppViewModel: ObservableObject {
     private let geminiPromptStorageKey = "DOC_TRUYEN_GEMINI_PROMPT"
     private let geminiModelStorageKey = "DOC_TRUYEN_GEMINI_MODEL"
     private let autoFallbackStorageKey = "DOC_TRUYEN_GEMINI_AUTO_FALLBACK"
+    private let skipAlreadyTranslatedStorageKey = "DOC_TRUYEN_SKIP_ALREADY_TRANSLATED"
     private let driveApiKeyOverrideStorageKey = "DOC_TRUYEN_DRIVE_API_KEY_OVERRIDE"
     private let driveFolderIdOverrideStorageKey = "DOC_TRUYEN_DRIVE_FOLDER_ID_OVERRIDE"
     private let driveAccessTokenStorageKey = "DOC_TRUYEN_DRIVE_ACCESS_TOKEN"
@@ -37,12 +39,13 @@ final class AppViewModel: ObservableObject {
     @Published var chapterContent: String = ""
     @Published var searchQuery: String = ""
 
-    /// Tăng mỗi khi chuyển sang chương mới để ép ScrollView tạo mới và cuộn về đầu trang (y = 0)
+    /// Tăng mỗi khi người dùng chủ động chuyển sang chương mới để cuộn về đầu trang (y = 0)
     @Published var readerScrollResetToken: Int = 0
     /// Tăng mỗi khi chuyển cụm chương trong Mục lục để ép danh sách mục lục cuộn lên đầu trang
     @Published var tocScrollResetToken: Int = 0
 
     @Published var isLoading: Bool = false
+    @Published var isChapterLoading: Bool = false
     @Published var errorMessage: String = ""
     @Published var toastMessage: String = ""
 
@@ -72,22 +75,44 @@ final class AppViewModel: ObservableObject {
     @Published var autoSwitchTo31OnQuota: Bool = true {
         didSet { UserDefaults.standard.set(autoSwitchTo31OnQuota, forKey: autoFallbackStorageKey) }
     }
+    /// Nếu bật: Những chương đã dịch sẵn trên máy sẽ không tốn thời gian dịch lại bằng AI mà được đẩy thẳng lên Drive nếu chưa đồng bộ
+    @Published var skipAlreadyTranslatedInBatch: Bool = true {
+        didSet { UserDefaults.standard.set(skipAlreadyTranslatedInBatch, forKey: skipAlreadyTranslatedStorageKey) }
+    }
 
     // MARK: - Google Drive Configuration & Cloud Write Sync
     @Published var driveApiKeyOverride: String = "" {
         didSet { UserDefaults.standard.set(driveApiKeyOverride, forKey: driveApiKeyOverrideStorageKey) }
     }
     @Published var driveFolderIdOverride: String = "" {
-        didSet { UserDefaults.standard.set(driveFolderIdOverride, forKey: driveFolderIdOverrideStorageKey) }
+        didSet {
+            // Nếu người dùng dán nhầm link Apps Script vào ô Folder ID, tự động chuyển sang ô Apps Script URL
+            if DriveInputParser.isAppsScriptUrl(driveFolderIdOverride) {
+                let normalized = DriveInputParser.normalizeAppsScriptUrl(driveFolderIdOverride)
+                driveAppsScriptUrl = normalized
+                driveFolderIdOverride = ""
+                UserDefaults.standard.set("", forKey: driveFolderIdOverrideStorageKey)
+                showToast("Đã tự động nhận diện Link Apps Script và giữ nguyên thư mục truyện!")
+                return
+            }
+            UserDefaults.standard.set(driveFolderIdOverride, forKey: driveFolderIdOverrideStorageKey)
+        }
     }
     @Published var driveAppsScriptUrl: String = "" {
-        didSet { UserDefaults.standard.set(driveAppsScriptUrl, forKey: driveAppsScriptUrlStorageKey) }
+        didSet {
+            let normalized = DriveInputParser.normalizeAppsScriptUrl(driveAppsScriptUrl)
+            if normalized != driveAppsScriptUrl {
+                driveAppsScriptUrl = normalized
+                return
+            }
+            UserDefaults.standard.set(driveAppsScriptUrl, forKey: driveAppsScriptUrlStorageKey)
+        }
     }
     @Published var driveAccessToken: String = "" {
         didSet { UserDefaults.standard.set(driveAccessToken, forKey: driveAccessTokenStorageKey) }
     }
 
-    // MARK: - Modals & Translation Range State
+    // MARK: - Modals, Background Translation & Background Drive Sync State
     @Published var showSettingsSheet: Bool = false
     @Published var showTranslationPopup: Bool = false
     @Published var translateFromChapterIndex: Int = 0
@@ -99,11 +124,19 @@ final class AppViewModel: ObservableObject {
     @Published var translationStatusNote: String = ""
     @Published var translatedRevisionTrigger: Int = 0
 
-    // MARK: - In-Memory Caches
+    /// Trạng thái đồng bộ ghi đè ngầm lên Google Drive (không chặn việc đọc truyện)
+    @Published var isSyncingToDrive: Bool = false
+    @Published var driveSyncProgressCount: Int = 0
+    @Published var driveSyncTotalCount: Int = 0
+    @Published var driveSyncStatusNote: String = ""
+
+    // MARK: - In-Memory Caches & Tasks
     private var folderCache: [String: (mode: ScreenMode, folders: [DriveItem], chapters: [DriveItem])] = [:]
     private var chapterContentCache: [String: String] = [:]
     private var prefetchingIds: Set<String> = []
     private var translationTask: Task<Void, Never>?
+    private var driveSyncTask: Task<Void, Never>?
+    private var backgroundTaskId: UIBackgroundTaskIdentifier = .invalid
 
     let tocWindowSize = 50
 
@@ -123,7 +156,8 @@ final class AppViewModel: ObservableObject {
     var bundledRootFolderId: String {
         let secret = GeneratedSecrets.googleDriveFolderId.trimmingCharacters(in: .whitespacesAndNewlines)
         if !secret.isEmpty {
-            return DriveInputParser.extractFolderId(from: secret)
+            let parsed = DriveInputParser.extractFolderId(from: secret)
+            if !parsed.isEmpty { return parsed }
         }
         let raw = (Bundle.main.object(forInfoDictionaryKey: "GoogleDriveFolderID") as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -211,14 +245,29 @@ final class AppViewModel: ObservableObject {
         if defaults.object(forKey: autoFallbackStorageKey) != nil {
             autoSwitchTo31OnQuota = defaults.bool(forKey: autoFallbackStorageKey)
         }
+        if defaults.object(forKey: skipAlreadyTranslatedStorageKey) != nil {
+            skipAlreadyTranslatedInBatch = defaults.bool(forKey: skipAlreadyTranslatedStorageKey)
+        }
         if let savedDriveKey = defaults.string(forKey: driveApiKeyOverrideStorageKey) {
             driveApiKeyOverride = savedDriveKey
         }
-        if let savedDriveFolder = defaults.string(forKey: driveFolderIdOverrideStorageKey) {
-            driveFolderIdOverride = savedDriveFolder
-        }
         if let savedScriptUrl = defaults.string(forKey: driveAppsScriptUrlStorageKey) {
-            driveAppsScriptUrl = savedScriptUrl
+            driveAppsScriptUrl = DriveInputParser.normalizeAppsScriptUrl(savedScriptUrl)
+        }
+        if let savedDriveFolder = defaults.string(forKey: driveFolderIdOverrideStorageKey) {
+            // Tự động sửa lỗi nếu trước đó người dùng dán link Apps Script vào ô Folder ID
+            if DriveInputParser.isAppsScriptUrl(savedDriveFolder) {
+                if driveAppsScriptUrl.isEmpty {
+                    driveAppsScriptUrl = DriveInputParser.normalizeAppsScriptUrl(savedDriveFolder)
+                }
+                driveFolderIdOverride = ""
+                defaults.set("", forKey: driveFolderIdOverrideStorageKey)
+            } else if DriveInputParser.extractFolderId(from: savedDriveFolder).isEmpty {
+                driveFolderIdOverride = ""
+                defaults.set("", forKey: driveFolderIdOverrideStorageKey)
+            } else {
+                driveFolderIdOverride = savedDriveFolder
+            }
         }
         if let savedToken = defaults.string(forKey: driveAccessTokenStorageKey) {
             driveAccessToken = savedToken
@@ -233,12 +282,41 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Quản lý giữ thức màn hình & chạy ngầm iOS khi đang dịch / ghi đè Drive
+    private func updateKeepAwakeState() {
+        let active = isTranslatingBatch || isSyncingToDrive
+        UIApplication.shared.isIdleTimerDisabled = active
+
+        if active {
+            if backgroundTaskId == .invalid {
+                backgroundTaskId = UIApplication.shared.beginBackgroundTask(withName: "DocTruyenCloudSync") { [weak self] in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        if self.backgroundTaskId != .invalid {
+                            UIApplication.shared.endBackgroundTask(self.backgroundTaskId)
+                            self.backgroundTaskId = .invalid
+                        }
+                    }
+                }
+            }
+        } else {
+            if backgroundTaskId != .invalid {
+                UIApplication.shared.endBackgroundTask(backgroundTaskId)
+                backgroundTaskId = .invalid
+            }
+        }
+    }
+
     func resetPromptToDefault() {
         translationPrompt = DefaultPrompts.standardNovelPolish
         showToast("Đã khôi phục câu lệnh dịch mặc định")
     }
 
     func applyCustomDriveSettingsAndReload() async {
+        if DriveInputParser.isAppsScriptUrl(driveFolderIdOverride) {
+            driveAppsScriptUrl = DriveInputParser.normalizeAppsScriptUrl(driveFolderIdOverride)
+            driveFolderIdOverride = ""
+        }
         folderCache.removeAll()
         LocalChapterStorage.shared.clearFolderDiskCache()
         let rootNode = FolderNode(id: activeRootFolderId, name: "Thư viện truyện")
@@ -260,8 +338,17 @@ final class AppViewModel: ObservableObject {
     // MARK: - Reading State Persistence
     private func loadPersistedReadingData() -> PersistedReadingData {
         guard let data = UserDefaults.standard.data(forKey: readingStateStorageKey),
-              let decoded = try? JSONDecoder().decode(PersistedReadingData.self, from: data) else {
+              var decoded = try? JSONDecoder().decode(PersistedReadingData.self, from: data) else {
             return PersistedReadingData(states: [:], lastReadingFolderId: nil)
+        }
+        // Loại bỏ các state bị hỏng Folder ID ("exec" / "dev" / rỗng) nếu có từ phiên cũ
+        decoded.states = decoded.states.filter { key, state in
+            let validKey = !DriveInputParser.extractFolderId(from: key).isEmpty
+            let validStack = state.folderStack.allSatisfy { !DriveInputParser.extractFolderId(from: $0.id).isEmpty }
+            return validKey && validStack
+        }
+        if let lastId = decoded.lastReadingFolderId, decoded.states[lastId] == nil {
+            decoded.lastReadingFolderId = nil
         }
         return decoded
     }
@@ -341,6 +428,7 @@ final class AppViewModel: ObservableObject {
             }
         }
 
+        folderStack = [rootNode]
         _ = await loadFolder(rootNode)
     }
 
@@ -360,8 +448,11 @@ final class AppViewModel: ObservableObject {
         nextSwipePromptVisible = false
         searchQuery = ""
 
+        let cleanFolderId = DriveInputParser.extractFolderId(from: folder.id)
+        let targetFolderId = cleanFolderId.isEmpty ? activeRootFolderId : cleanFolderId
+
         if !forceRefreshFromDrive {
-            if let cached = folderCache[folder.id] {
+            if let cached = folderCache[targetFolderId], (!cached.folders.isEmpty || !cached.chapters.isEmpty) {
                 if !silent {
                     screenMode = cached.mode
                     folders = cached.folders
@@ -370,10 +461,10 @@ final class AppViewModel: ObservableObject {
                 return cached
             }
 
-            if let diskCached = LocalChapterStorage.shared.loadFolderSnapshotFromDisk(folderId: folder.id) {
+            if let diskCached = LocalChapterStorage.shared.loadFolderSnapshotFromDisk(folderId: targetFolderId) {
                 let mode: ScreenMode = diskCached.isChaptersMode ? .chapters : .folders
                 let tuple = (mode: mode, folders: diskCached.folders, chapters: diskCached.chapters)
-                folderCache[folder.id] = tuple
+                folderCache[targetFolderId] = tuple
                 if !silent {
                     screenMode = mode
                     folders = diskCached.folders
@@ -394,17 +485,18 @@ final class AppViewModel: ObservableObject {
 
         do {
             let children = try await DriveService.shared.listChildren(
-                folderId: folder.id,
-                apiKey: activeDriveApiKey
+                folderId: targetFolderId,
+                apiKey: activeDriveApiKey,
+                appsScriptWebAppUrl: driveAppsScriptUrl
             )
             let txtFiles = children.filter { $0.isTextFile }
             let childFolders = children.filter { $0.isFolder }
 
             if !txtFiles.isEmpty {
                 let result: (mode: ScreenMode, folders: [DriveItem], chapters: [DriveItem]) = (.chapters, [], txtFiles)
-                folderCache[folder.id] = result
+                folderCache[targetFolderId] = result
                 LocalChapterStorage.shared.saveFolderSnapshotToDisk(
-                    folderId: folder.id,
+                    folderId: targetFolderId,
                     isChaptersMode: true,
                     folders: [],
                     chapters: txtFiles
@@ -437,13 +529,15 @@ final class AppViewModel: ObservableObject {
             }
 
             let result: (mode: ScreenMode, folders: [DriveItem], chapters: [DriveItem]) = (.folders, enrichedFolders, [])
-            folderCache[folder.id] = result
-            LocalChapterStorage.shared.saveFolderSnapshotToDisk(
-                folderId: folder.id,
-                isChaptersMode: false,
-                folders: enrichedFolders,
-                chapters: []
-            )
+            if !enrichedFolders.isEmpty {
+                folderCache[targetFolderId] = result
+                LocalChapterStorage.shared.saveFolderSnapshotToDisk(
+                    folderId: targetFolderId,
+                    isChaptersMode: false,
+                    folders: enrichedFolders,
+                    chapters: []
+                )
+            }
             if !silent {
                 screenMode = .folders
                 folders = enrichedFolders
@@ -484,7 +578,7 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Chapter Reading & Local File Caching / Overwriting
+    // MARK: - Chapter Reading & Local File Caching (Hoạt động song song không chặn tiến trình dịch/upload)
     func fetchChapterText(_ chapter: DriveItem, forceRemote: Bool = false) async throws -> String {
         if !forceRemote {
             if let localSaved = LocalChapterStorage.shared.readChapterContent(chapterId: chapter.id),
@@ -492,17 +586,22 @@ final class AppViewModel: ObservableObject {
                 chapterContentCache[chapter.id] = localSaved
                 return localSaved
             }
-            if let cached = chapterContentCache[chapter.id] {
+            if let cached = chapterContentCache[chapter.id],
+               !cached.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return cached
             }
         }
 
         let downloaded = try await DriveService.shared.downloadTextFile(
             fileId: chapter.id,
-            apiKey: activeDriveApiKey
+            apiKey: activeDriveApiKey,
+            appsScriptWebAppUrl: driveAppsScriptUrl,
+            accessToken: driveAccessToken
         )
 
         chapterContentCache[chapter.id] = downloaded
+        LocalChapterStorage.shared.saveOriginalChapterIfNeeded(chapterId: chapter.id, content: downloaded)
+
         if !LocalChapterStorage.shared.isChapterTranslated(chapter.id) {
             try? LocalChapterStorage.shared.overwriteChapterFile(
                 chapterId: chapter.id,
@@ -514,12 +613,28 @@ final class AppViewModel: ObservableObject {
         return downloaded
     }
 
+    /// Lấy văn bản để đưa vào Gemini AI dịch (Ưu tiên bản gốc chưa dịch nếu có để tránh dịch chồng lên bản đã dịch)
+    private func fetchSourceTextForTranslation(_ chapter: DriveItem) async throws -> String {
+        if let rawOriginal = LocalChapterStorage.shared.readOriginalChapterContent(chapterId: chapter.id),
+           !rawOriginal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return rawOriginal
+        }
+        if !LocalChapterStorage.shared.isChapterTranslated(chapter.id),
+           let localUntranslated = LocalChapterStorage.shared.readChapterContent(chapterId: chapter.id),
+           !localUntranslated.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            LocalChapterStorage.shared.saveOriginalChapterIfNeeded(chapterId: chapter.id, content: localUntranslated)
+            return localUntranslated
+        }
+        return try await fetchChapterText(chapter, forceRemote: true)
+    }
+
     func openChapter(_ chapter: DriveItem) async {
         errorMessage = ""
         selectedChapter = chapter
         tocVisible = false
         nextSwipePromptVisible = false
 
+        // 1. Nếu chương đã có sẵn trong bộ nhớ máy hoặc RAM -> Mở tức thì (0ms), không hiện màn hình chờ
         if let localSaved = LocalChapterStorage.shared.readChapterContent(chapterId: chapter.id),
            !localSaved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             chapterContentCache[chapter.id] = localSaved
@@ -535,10 +650,9 @@ final class AppViewModel: ObservableObject {
             return
         }
 
-        isLoading = true
-        do {
-            let text = try await fetchChapterText(chapter)
-            chapterContent = text
+        if let cached = chapterContentCache[chapter.id],
+           !cached.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            chapterContent = cached
             screenMode = .reader
             readerScrollResetToken += 1
 
@@ -547,11 +661,32 @@ final class AppViewModel: ObservableObject {
                 prefetchNextChapter(after: idx)
             }
             saveReadingProgress(paragraphIndex: 0, chapterOverride: chapter)
-        } catch {
-            errorMessage = error.localizedDescription
+            return
         }
 
-        isLoading = false
+        // 2. Nếu chưa có trong máy -> Chuyển sang màn hình đọc kèm chỉ báo tải nhẹ để không ngắt luồng đọc
+        screenMode = .reader
+        isChapterLoading = true
+        chapterContent = "Đang tải nội dung \(chapter.cleanChapterName)..."
+        do {
+            let text = try await fetchChapterText(chapter)
+            if selectedChapter?.id == chapter.id {
+                chapterContent = text
+                readerScrollResetToken += 1
+            }
+
+            if let idx = chapters.firstIndex(where: { $0.id == chapter.id }) {
+                tocStartIndex = computeTocStart(for: idx)
+                prefetchNextChapter(after: idx)
+            }
+            saveReadingProgress(paragraphIndex: 0, chapterOverride: chapter)
+        } catch {
+            errorMessage = error.localizedDescription
+            if selectedChapter?.id == chapter.id {
+                chapterContent = "Không tải được nội dung chương: \(error.localizedDescription)"
+            }
+        }
+        isChapterLoading = false
     }
 
     func openNextChapter() async {
@@ -607,22 +742,25 @@ final class AppViewModel: ObservableObject {
         tocScrollResetToken += 1
     }
 
-    // MARK: - Gemini Translation Popup & Batch Overwrite (Trên máy + Trên Google Drive)
+    // MARK: - Gemini Translation & Guaranteed Cloud Overwrite (Chạy ngầm mượt mà, đọc tiếp thoải mái, không bỏ sót chương nào)
     func prepareAndOpenTranslationPopup() {
         guard !chapters.isEmpty else {
             showToast("Không có chương nào để dịch.")
             return
         }
-        let currentIdx = max(0, currentChapterIndex)
-        translateFromChapterIndex = currentIdx
-        translateToChapterIndex = currentIdx
-        translationStatusNote = ""
+        if !isTranslatingBatch {
+            let currentIdx = max(0, currentChapterIndex)
+            translateFromChapterIndex = currentIdx
+            translateToChapterIndex = currentIdx
+            translationStatusNote = ""
+        }
         showTranslationPopup = true
     }
 
     func cancelBatchTranslation() {
         translationTask?.cancel()
         isTranslatingBatch = false
+        updateKeepAwakeState()
         translationStatusNote = "Đã dừng tiến trình dịch."
     }
 
@@ -632,96 +770,172 @@ final class AppViewModel: ObservableObject {
         let endIdx = min(chapters.count - 1, max(translateFromChapterIndex, translateToChapterIndex))
 
         let cleanKey = geminiApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanKey.isEmpty else {
+        let targetSlice = Array(chapters[startIdx...endIdx])
+
+        // Nếu trong dải chọn có chương chưa dịch thì bắt buộc phải có Gemini API Key
+        let hasUntranslatedInSlice = targetSlice.contains { !LocalChapterStorage.shared.isChapterTranslated($0.id) }
+        if (hasUntranslatedInSlice || !skipAlreadyTranslatedInBatch) && cleanKey.isEmpty {
             translationStatusNote = "⚠️ Bạn chưa nhập Gemini API Key! Hãy nhập API Key ngay bên dưới hoặc trong phần Cài đặt."
             return
         }
 
+        translationTask?.cancel()
         isTranslatingBatch = true
-        let targetSlice = Array(chapters[startIdx...endIdx])
+        updateKeepAwakeState()
+
         translationTotalCount = targetSlice.count
         translationProgressCount = 0
-        translationStatusNote = "Đang khởi tạo tiến trình dịch..."
+        translationStatusNote = "Đang khởi tạo tiến trình dịch & ghi đè..."
         let currentStoryTitle = currentFolder.name
+        let shouldSkipTranslated = skipAlreadyTranslatedInBatch
 
         translationTask = Task {
-            var successCount = 0
+            var translatedSuccessCount = 0
             var cloudSuccessCount = 0
             var switchedModelNotice = ""
+            var lastDriveWarning = ""
+            var failedChaptersForRetry: [DriveItem] = []
 
+            // VÒNG 1: Xử lý toàn bộ các chương trong dải đã chọn (Không dừng ngang khi 1 chương lỗi)
             for (offset, chapter) in targetSlice.enumerated() {
                 if Task.isCancelled { break }
 
+                let alreadyTranslatedLocally = LocalChapterStorage.shared.isChapterTranslated(chapter.id)
+                let alreadySyncedToDrive = LocalChapterStorage.shared.isChapterSyncedToDrive(chapter.id)
+
+                // Nếu chương đã được dịch sẵn trên máy và bật chế độ không dịch lại:
+                // Kiểm tra đẩy bù ngay lên Google Drive để đảm bảo không bỏ sót chương đã dịch nào!
+                if alreadyTranslatedLocally && shouldSkipTranslated {
+                    if let localTranslatedText = LocalChapterStorage.shared.readChapterContent(chapterId: chapter.id),
+                       !localTranslatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+
+                        if !alreadySyncedToDrive && isCloudOverwriteConfigured {
+                            translationCurrentChapterTitle = chapter.cleanChapterName
+                            translationStatusNote = "Đang ghi đè bù lên Drive (\(offset + 1)/\(targetSlice.count)): \(chapter.cleanChapterName)..."
+
+                            let savedTitle = LocalChapterStorage.shared.customTitle(for: chapter.id)
+                                ?? ChapterTitleExtractor.extractUpdatedChapterTitle(
+                                    rawFileName: chapter.name,
+                                    storyTitle: currentStoryTitle,
+                                    chapterContent: localTranslatedText
+                                )
+
+                            let driveSync = await DriveService.shared.overwriteRemoteDriveFile(
+                                fileId: chapter.id,
+                                newFileName: savedTitle,
+                                content: localTranslatedText,
+                                apiKey: activeDriveApiKey,
+                                appsScriptWebAppUrl: driveAppsScriptUrl,
+                                accessToken: driveAccessToken
+                            )
+                            if driveSync.success {
+                                LocalChapterStorage.shared.markChapterSyncedToDrive(chapter.id, synced: true)
+                                cloudSuccessCount += 1
+                            } else {
+                                lastDriveWarning = driveSync.message
+                            }
+                            try? await Task.sleep(nanoseconds: 250_000_000)
+                        } else if alreadySyncedToDrive {
+                            cloudSuccessCount += 1
+                        }
+
+                        translatedSuccessCount += 1
+                        translationProgressCount = offset + 1
+                        translatedRevisionTrigger += 1
+                        continue
+                    }
+                }
+
+                // Dịch chương qua Gemini AI
                 translationCurrentChapterTitle = chapter.cleanChapterName
                 translationStatusNote = "Đang dịch (\(offset + 1)/\(targetSlice.count)): \(chapter.cleanChapterName)..."
 
-                do {
-                    let sourceText = try await fetchChapterText(chapter)
+                let stepSuccess = await translateAndOverwriteSingleChapter(
+                    chapter: chapter,
+                    storyTitle: currentStoryTitle,
+                    apiKey: cleanKey,
+                    switchedModelNotice: &switchedModelNotice,
+                    cloudSuccessCount: &cloudSuccessCount,
+                    lastDriveWarning: &lastDriveWarning
+                )
 
-                    let outcome = try await GeminiService.shared.translateChapterContent(
-                        rawContent: sourceText,
-                        customInstruction: translationPrompt,
-                        apiKey: cleanKey,
-                        preferredModel: selectedGeminiModel,
-                        autoFallbackWhenQuotaExceeded: autoSwitchTo31OnQuota
-                    )
+                if stepSuccess {
+                    translatedSuccessCount += 1
+                } else {
+                    failedChaptersForRetry.append(chapter)
+                }
 
-                    if outcome.didAutoSwitchToFallback {
-                        selectedGeminiModel = outcome.usedModelChoice
-                        switchedModelNotice = " (Đã tự động chuyển sang \(outcome.usedModelChoice.shortBadge))"
-                    }
+                translationProgressCount = offset + 1
+                translatedRevisionTrigger += 1
 
-                    // Quét vài dòng đầu để lấy nguyên câu bắt đầu bằng chữ "Chương" làm tên chương mới
-                    let extractedNewTitle = ChapterTitleExtractor.extractUpdatedChapterTitle(
-                        rawFileName: chapter.name,
+                // Nhịp nghỉ ngắn 350ms giữa các chương để giao diện đọc truyện luôn mượt và tránh nghẽn mạng
+                if offset + 1 < targetSlice.count && !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 350_000_000)
+                }
+            }
+
+            // VÒNG 2: Tự động dịch lại các chương bị lỗi mạng/quá tải tạm thời ở Vòng 1 (nếu có)
+            if !failedChaptersForRetry.isEmpty && !Task.isCancelled {
+                translationStatusNote = "Đang tự động thử lại \(failedChaptersForRetry.count) chương bị nghẽn mạng..."
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+
+                for (retryIdx, chapter) in failedChaptersForRetry.enumerated() {
+                    if Task.isCancelled { break }
+                    translationCurrentChapterTitle = chapter.cleanChapterName
+                    translationStatusNote = "Thử lại (\(retryIdx + 1)/\(failedChaptersForRetry.count)): \(chapter.cleanChapterName)..."
+
+                    let retryOk = await translateAndOverwriteSingleChapter(
+                        chapter: chapter,
                         storyTitle: currentStoryTitle,
-                        chapterContent: outcome.translatedText
+                        apiKey: cleanKey,
+                        switchedModelNotice: &switchedModelNotice,
+                        cloudSuccessCount: &cloudSuccessCount,
+                        lastDriveWarning: &lastDriveWarning
                     )
+                    if retryOk {
+                        translatedSuccessCount += 1
+                        translatedRevisionTrigger += 1
+                    }
+                }
+            }
 
-                    // 1. Ghi đè trực tiếp vào file chương trên bộ nhớ máy
-                    try LocalChapterStorage.shared.overwriteChapterFile(
-                        chapterId: chapter.id,
-                        chapterName: chapter.name,
-                        content: outcome.translatedText,
-                        markAsTranslated: true,
-                        updatedChapterTitle: extractedNewTitle
-                    )
-
-                    chapterContentCache[chapter.id] = outcome.translatedText
-
-                    if let newTitle = extractedNewTitle {
-                        if let globalIdx = chapters.firstIndex(where: { $0.id == chapter.id }) {
-                            chapters[globalIdx].name = "\(newTitle).txt"
+            // VÒNG 3: Quét toàn bộ các chương ĐÃ DỊCH trong truyện nhưng CHƯA GHI ĐÈ lên Drive để đẩy bù 100%
+            if isCloudOverwriteConfigured && !Task.isCancelled {
+                let remainingUnsynced = LocalChapterStorage.shared.unsyncedTranslatedChapters(in: chapters)
+                if !remainingUnsynced.isEmpty {
+                    for (idx, unsyncedChap) in remainingUnsynced.enumerated() {
+                        if Task.isCancelled { break }
+                        guard let localText = LocalChapterStorage.shared.readChapterContent(chapterId: unsyncedChap.id),
+                              !localText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                            continue
                         }
-                        if selectedChapter?.id == chapter.id {
-                            selectedChapter?.name = "\(newTitle).txt"
+                        translationCurrentChapterTitle = unsyncedChap.cleanChapterName
+                        translationStatusNote = "Đang ghi đè bù chương đã dịch lên Drive (\(idx + 1)/\(remainingUnsynced.count)): \(unsyncedChap.cleanChapterName)..."
+
+                        let newTitle = LocalChapterStorage.shared.customTitle(for: unsyncedChap.id)
+                            ?? ChapterTitleExtractor.extractUpdatedChapterTitle(
+                                rawFileName: unsyncedChap.name,
+                                storyTitle: currentStoryTitle,
+                                chapterContent: localText
+                            )
+
+                        let res = await DriveService.shared.overwriteRemoteDriveFile(
+                            fileId: unsyncedChap.id,
+                            newFileName: newTitle,
+                            content: localText,
+                            apiKey: activeDriveApiKey,
+                            appsScriptWebAppUrl: driveAppsScriptUrl,
+                            accessToken: driveAccessToken
+                        )
+                        if res.success {
+                            LocalChapterStorage.shared.markChapterSyncedToDrive(unsyncedChap.id, synced: true)
+                            cloudSuccessCount += 1
+                            translatedRevisionTrigger += 1
+                        } else {
+                            lastDriveWarning = res.message
                         }
+                        try? await Task.sleep(nanoseconds: 250_000_000)
                     }
-
-                    if selectedChapter?.id == chapter.id {
-                        chapterContent = outcome.translatedText
-                    }
-
-                    // 2. Ghi đè nội dung đã dịch và tên chương mới lên thẳng Google Drive
-                    let driveSync = await DriveService.shared.overwriteRemoteDriveFile(
-                        fileId: chapter.id,
-                        newFileName: extractedNewTitle,
-                        content: outcome.translatedText,
-                        apiKey: activeDriveApiKey,
-                        appsScriptWebAppUrl: driveAppsScriptUrl,
-                        accessToken: driveAccessToken
-                    )
-                    if driveSync.success {
-                        cloudSuccessCount += 1
-                    }
-
-                    successCount += 1
-                    translationProgressCount = offset + 1
-                    translatedRevisionTrigger += 1
-                } catch {
-                    translationStatusNote = "❌ Lỗi tại \(chapter.cleanChapterName): \(error.localizedDescription)"
-                    isTranslatingBatch = false
-                    return
                 }
             }
 
@@ -736,22 +950,118 @@ final class AppViewModel: ObservableObject {
             }
 
             isTranslatingBatch = false
+            updateKeepAwakeState()
+
             if !Task.isCancelled {
-                if cloudSuccessCount > 0 {
-                    translationStatusNote = "✅ Đã dịch & ghi đè \(successCount) chương trên máy + \(cloudSuccessCount) chương trên Google Drive!\(switchedModelNotice)"
+                let totalUnsyncedLeft = LocalChapterStorage.shared.unsyncedTranslatedChapters(in: chapters).count
+                if isCloudOverwriteConfigured {
+                    if totalUnsyncedLeft == 0 {
+                        translationStatusNote = "✅ Hoàn tất! Đã dịch & ghi đè đầy đủ \(translatedSuccessCount)/\(targetSlice.count) chương lên Google Drive!\(switchedModelNotice)"
+                    } else {
+                        translationStatusNote = "⚠️ Đã dịch \(translatedSuccessCount)/\(targetSlice.count) chương trên máy, còn \(totalUnsyncedLeft) chương chưa ghi đè được lên Drive (\(lastDriveWarning))."
+                    }
                 } else {
-                    translationStatusNote = "✅ Đã dịch & ghi đè \(successCount) chương vào bộ nhớ máy!\(switchedModelNotice)"
+                    translationStatusNote = "✅ Đã dịch & lưu \(translatedSuccessCount)/\(targetSlice.count) chương vào bộ nhớ máy!\(switchedModelNotice)"
                 }
-                showToast("Đã dịch và ghi đè \(successCount) chương thành công!")
+                showToast("Đã xử lý xong \(translatedSuccessCount)/\(targetSlice.count) chương!")
             }
         }
     }
 
-    /// Đẩy toàn bộ các chương đã dịch trong bộ truyện hiện tại lên ghi đè trên Google Drive
-    func syncAllTranslatedChaptersToDrive() async {
-        let translatedChapters = chapters.filter { LocalChapterStorage.shared.isChapterTranslated($0.id) }
-        guard !translatedChapters.isEmpty else {
-            showToast("Chưa có chương nào đã dịch để đồng bộ lên Drive.")
+    /// Dịch 1 chương và ghi đè lên máy + Google Drive (Cập nhật mượt mà không làm giật vị trí cuộn của người đọc)
+    private func translateAndOverwriteSingleChapter(
+        chapter: DriveItem,
+        storyTitle: String,
+        apiKey: String,
+        switchedModelNotice: inout String,
+        cloudSuccessCount: inout Int,
+        lastDriveWarning: inout String
+    ) async -> Bool {
+        do {
+            let sourceText = try await fetchSourceTextForTranslation(chapter)
+
+            let outcome = try await GeminiService.shared.translateChapterContent(
+                rawContent: sourceText,
+                customInstruction: translationPrompt,
+                apiKey: apiKey,
+                preferredModel: selectedGeminiModel,
+                autoFallbackWhenQuotaExceeded: autoSwitchTo31OnQuota
+            )
+
+            if outcome.didAutoSwitchToFallback {
+                selectedGeminiModel = outcome.usedModelChoice
+                switchedModelNotice = " (Đã tự động chuyển sang \(outcome.usedModelChoice.shortBadge))"
+            }
+
+            let extractedNewTitle = ChapterTitleExtractor.extractUpdatedChapterTitle(
+                rawFileName: chapter.name,
+                storyTitle: storyTitle,
+                chapterContent: outcome.translatedText
+            )
+
+            // 1. Ghi đè trực tiếp vào file chương trên bộ nhớ máy
+            try LocalChapterStorage.shared.overwriteChapterFile(
+                chapterId: chapter.id,
+                chapterName: chapter.name,
+                content: outcome.translatedText,
+                markAsTranslated: true,
+                markAsSyncedToDrive: false,
+                updatedChapterTitle: extractedNewTitle
+            )
+
+            chapterContentCache[chapter.id] = outcome.translatedText
+
+            if let newTitle = extractedNewTitle {
+                if let globalIdx = chapters.firstIndex(where: { $0.id == chapter.id }) {
+                    chapters[globalIdx].name = "\(newTitle).txt"
+                }
+                if selectedChapter?.id == chapter.id {
+                    selectedChapter?.name = "\(newTitle).txt"
+                }
+            }
+
+            // Nếu người dùng đang mở đúng chương này thì cập nhật nội dung mới mà KHÔNG reset vị trí cuộn
+            if selectedChapter?.id == chapter.id {
+                chapterContent = outcome.translatedText
+            }
+
+            // 2. Ghi đè nội dung đã dịch và tên chương mới lên thẳng Google Drive
+            if isCloudOverwriteConfigured {
+                translationStatusNote = "Đang ghi đè lên Drive: \(extractedNewTitle ?? chapter.cleanChapterName)..."
+                let driveSync = await DriveService.shared.overwriteRemoteDriveFile(
+                    fileId: chapter.id,
+                    newFileName: extractedNewTitle,
+                    content: outcome.translatedText,
+                    apiKey: activeDriveApiKey,
+                    appsScriptWebAppUrl: driveAppsScriptUrl,
+                    accessToken: driveAccessToken
+                )
+                if driveSync.success {
+                    LocalChapterStorage.shared.markChapterSyncedToDrive(chapter.id, synced: true)
+                    cloudSuccessCount += 1
+                } else {
+                    lastDriveWarning = driveSync.message
+                }
+            }
+
+            return true
+        } catch {
+            lastDriveWarning = error.localizedDescription
+            return false
+        }
+    }
+
+    // MARK: - Đồng bộ đẩy toàn bộ chương đã dịch lên Google Drive (Chạy ngầm 100%, vừa upload vừa đọc truyện bình thường)
+    func syncAllTranslatedChaptersToDrive(onlyUnsynced: Bool = false) async {
+        let targetList: [DriveItem]
+        if onlyUnsynced {
+            targetList = LocalChapterStorage.shared.unsyncedTranslatedChapters(in: chapters)
+        } else {
+            targetList = chapters.filter { LocalChapterStorage.shared.isChapterTranslated($0.id) }
+        }
+
+        guard !targetList.isEmpty else {
+            showToast("Tất cả chương đã dịch đều đã được ghi đè lên Google Drive!")
             return
         }
         guard isCloudOverwriteConfigured else {
@@ -759,11 +1069,37 @@ final class AppViewModel: ObservableObject {
             return
         }
 
-        isLoading = true
-        var syncedCount = 0
-        for chap in translatedChapters {
-            if let localText = LocalChapterStorage.shared.readChapterContent(chapterId: chap.id) {
+        driveSyncTask?.cancel()
+        isSyncingToDrive = true
+        updateKeepAwakeState()
+
+        driveSyncTotalCount = targetList.count
+        driveSyncProgressCount = 0
+        driveSyncStatusNote = "Đang chuẩn bị ghi đè \(targetList.count) chương đã dịch lên Drive..."
+        let currentStoryTitle = currentFolder.name
+
+        driveSyncTask = Task {
+            var syncedCount = 0
+            var lastErrorMsg = ""
+
+            for (idx, chap) in targetList.enumerated() {
+                if Task.isCancelled { break }
+
+                guard let localText = LocalChapterStorage.shared.readChapterContent(chapterId: chap.id),
+                      !localText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    driveSyncProgressCount = idx + 1
+                    continue
+                }
+
+                driveSyncStatusNote = "Đang ghi đè lên Drive (\(idx + 1)/\(targetList.count)): \(chap.cleanChapterName)..."
+
                 let newTitle = LocalChapterStorage.shared.customTitle(for: chap.id)
+                    ?? ChapterTitleExtractor.extractUpdatedChapterTitle(
+                        rawFileName: chap.name,
+                        storyTitle: currentStoryTitle,
+                        chapterContent: localText
+                    )
+
                 let res = await DriveService.shared.overwriteRemoteDriveFile(
                     fileId: chap.id,
                     newFileName: newTitle,
@@ -773,17 +1109,44 @@ final class AppViewModel: ObservableObject {
                     accessToken: driveAccessToken
                 )
                 if res.success {
+                    LocalChapterStorage.shared.markChapterSyncedToDrive(chap.id, synced: true)
                     syncedCount += 1
+                    translatedRevisionTrigger += 1
+                } else {
+                    lastErrorMsg = res.message
+                }
+
+                driveSyncProgressCount = idx + 1
+                if idx + 1 < targetList.count && !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                }
+            }
+
+            isSyncingToDrive = false
+            updateKeepAwakeState()
+
+            if !Task.isCancelled {
+                if syncedCount == targetList.count {
+                    driveSyncStatusNote = "✅ Đã ghi đè thành công toàn bộ \(syncedCount)/\(targetList.count) chương lên Google Drive!"
+                    showToast("Đã ghi đè \(syncedCount)/\(targetList.count) chương lên Drive!")
+                } else {
+                    driveSyncStatusNote = "⚠️ Đã ghi đè \(syncedCount)/\(targetList.count) chương. Lỗi: \(lastErrorMsg)"
+                    showToast("Đã ghi đè \(syncedCount)/\(targetList.count) chương lên Drive")
                 }
             }
         }
-        isLoading = false
-        showToast("Đã ghi đè \(syncedCount)/\(translatedChapters.count) chương đã dịch lên Google Drive!")
+    }
+
+    func cancelDriveSync() {
+        driveSyncTask?.cancel()
+        isSyncingToDrive = false
+        updateKeepAwakeState()
+        driveSyncStatusNote = "Đã dừng đồng bộ Google Drive."
     }
 
     func restoreOriginalFromDrive(for chapter: DriveItem) async {
-        isLoading = true
-        defer { isLoading = false }
+        isChapterLoading = true
+        defer { isChapterLoading = false }
         do {
             LocalChapterStorage.shared.removeTranslatedOverride(chapterId: chapter.id)
             chapterContentCache.removeValue(forKey: chapter.id)
