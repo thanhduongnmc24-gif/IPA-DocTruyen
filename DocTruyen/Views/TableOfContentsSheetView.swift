@@ -6,10 +6,10 @@ struct TableOfContentsSheetView: View {
 
     var body: some View {
         let palette = ThemePalette.forTheme(viewModel.readerTheme)
+        let _ = viewModel.translatedRevisionTrigger
 
         NavigationStack {
             VStack(spacing: 0) {
-                // Font & Theme Quick Bar
                 VStack(spacing: 12) {
                     HStack {
                         Label("Cỡ chữ: \(Int(viewModel.storyFontSize)) pt", systemImage: "textformat.size")
@@ -84,7 +84,7 @@ struct TableOfContentsSheetView: View {
 
                 Divider()
 
-                // Pagination Bar
+                // Pagination Bar (Chuyển cụm chương)
                 HStack {
                     Button {
                         viewModel.prevTocPage()
@@ -128,57 +128,70 @@ struct TableOfContentsSheetView: View {
                 .padding(.vertical, 10)
                 .background(palette.background)
 
-                // Chapter Slice List
-                ScrollView {
-                    LazyVStack(spacing: 8) {
-                        ForEach(Array(viewModel.currentTocSlice.enumerated()), id: \.element.id) { offset, chapter in
-                            let globalIndex = viewModel.tocStartIndex + offset
-                            let isCurrent = viewModel.selectedChapter?.id == chapter.id
-                            let isTranslated = LocalChapterStorage.shared.isChapterTranslated(chapter.id)
+                // Danh sách chương trong cụm: Tự động tạo mới ScrollView và cuộn lên đầu trang khi bấm sang cụm chương khác
+                ScrollViewReader { scrollProxy in
+                    ScrollView {
+                        LazyVStack(spacing: 8) {
+                            Color.clear
+                                .frame(height: 1)
+                                .id("TOC_TOP_ANCHOR")
 
-                            Button {
-                                dismiss()
-                                Task {
-                                    await viewModel.openChapter(chapter)
-                                }
-                            } label: {
-                                HStack(spacing: 12) {
-                                    Text("\(globalIndex + 1)")
-                                        .font(.caption.weight(.bold))
-                                        .frame(width: 34, height: 34)
-                                        .background(isCurrent ? palette.accent : palette.border.opacity(0.5))
-                                        .foregroundStyle(isCurrent ? .white : palette.primaryText)
-                                        .clipShape(Circle())
+                            ForEach(Array(viewModel.currentTocSlice.enumerated()), id: \.element.id) { offset, chapter in
+                                let globalIndex = viewModel.tocStartIndex + offset
+                                let isCurrent = viewModel.selectedChapter?.id == chapter.id
+                                let isTranslated = LocalChapterStorage.shared.isChapterTranslated(chapter.id)
 
-                                    Text(chapter.cleanChapterName)
-                                        .font(.subheadline.weight(isCurrent ? .bold : .medium))
-                                        .foregroundStyle(isCurrent ? palette.accent : palette.primaryText)
-                                        .multilineTextAlignment(.leading)
-                                        .lineLimit(2)
-
-                                    Spacer()
-
-                                    if isTranslated {
-                                        Text("Đã dịch AI")
-                                            .font(.system(size: 10, weight: .bold))
-                                            .padding(.horizontal, 8)
-                                            .padding(.vertical, 4)
-                                            .background(Color.green.opacity(0.18))
-                                            .foregroundStyle(Color.green)
-                                            .clipShape(Capsule())
+                                Button {
+                                    dismiss()
+                                    Task {
+                                        await viewModel.openChapter(chapter)
                                     }
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        Text("\(globalIndex + 1)")
+                                            .font(.caption.weight(.bold))
+                                            .frame(width: 34, height: 34)
+                                            .background(isCurrent ? palette.accent : palette.border.opacity(0.5))
+                                            .foregroundStyle(isCurrent ? .white : palette.primaryText)
+                                            .clipShape(Circle())
+
+                                        Text(chapter.cleanChapterName)
+                                            .font(.subheadline.weight(isCurrent ? .bold : .medium))
+                                            .foregroundStyle(isCurrent ? palette.accent : palette.primaryText)
+                                            .multilineTextAlignment(.leading)
+                                            .lineLimit(2)
+
+                                        Spacer()
+
+                                        if isTranslated {
+                                            Text("Đã dịch AI")
+                                                .font(.system(size: 10, weight: .bold))
+                                                .padding(.horizontal, 8)
+                                                .padding(.vertical, 4)
+                                                .background(Color.green.opacity(0.18))
+                                                .foregroundStyle(Color.green)
+                                                .clipShape(Capsule())
+                                        }
+                                    }
+                                    .padding(12)
+                                    .background(isCurrent ? palette.accent.opacity(0.12) : palette.cardBackground)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 12)
+                                            .stroke(isCurrent ? palette.accent : palette.border, lineWidth: 1)
+                                    )
+                                    .clipShape(RoundedRectangle(cornerRadius: 12))
                                 }
-                                .padding(12)
-                                .background(isCurrent ? palette.accent.opacity(0.12) : palette.cardBackground)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 12)
-                                        .stroke(isCurrent ? palette.accent : palette.border, lineWidth: 1)
-                                )
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
                             }
                         }
+                        .padding(14)
                     }
-                    .padding(14)
+                    .id("TOC_SCROLL_\(viewModel.tocStartIndex)_\(viewModel.tocScrollResetToken)")
+                    .onChange(of: viewModel.tocStartIndex) { _ in
+                        scrollProxy.scrollTo("TOC_TOP_ANCHOR", anchor: .top)
+                    }
+                    .onChange(of: viewModel.tocScrollResetToken) { _ in
+                        scrollProxy.scrollTo("TOC_TOP_ANCHOR", anchor: .top)
+                    }
                 }
                 .background(palette.background)
             }
