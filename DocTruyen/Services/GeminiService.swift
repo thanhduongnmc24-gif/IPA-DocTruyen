@@ -13,7 +13,7 @@ enum GeminiServiceError: LocalizedError {
         case .emptyContent:
             return "Nội dung chương trống, không có gì để dịch."
         case .quotaExceededAllModels(let detail):
-            return "Đã hết hạn mức (Quota) trên cả hai model 3.5 Flash Lite và 3.1 Flash Lite: \(detail)"
+            return "Máy chủ Gemini hiện đang quá tải hoặc hết hạn mức (Quota) trên tất cả các model dự phòng: \(detail)"
         case .apiError(let message):
             return message
         }
@@ -59,7 +59,6 @@ final class GeminiService {
             ? DefaultPrompts.standardNovelPolish
             : customInstruction
 
-        // Thứ tự ưu tiên: Model đang chọn -> nếu hết quota và bật tự động chuyển thì thử sang model còn lại
         var modelOrder: [GeminiModelChoice] = [preferredModel]
         if autoFallbackWhenQuotaExceeded {
             let fallback: GeminiModelChoice = (preferredModel == .flash35Lite) ? .flash31Lite : .flash35Lite
@@ -72,32 +71,51 @@ final class GeminiService {
             let candidates = choice.candidateEndpointModels
 
             for endpointModel in candidates {
-                do {
-                    let resultText = try await callGenerateContent(
-                        endpointModel: endpointModel,
-                        apiKey: cleanKey,
-                        systemInstruction: instruction,
-                        userContent: trimmedContent
-                    )
-                    return GeminiTranslationOutcome(
-                        translatedText: resultText,
-                        usedModelChoice: choice,
-                        actualEndpointModel: endpointModel,
-                        didAutoSwitchToFallback: choiceIndex > 0
-                    )
-                } catch let err as InternalCallError {
-                    lastErrorMessage = err.message
-                    if err.isModelNotFound {
-                        // Thử candidate model ID tiếp theo trong cùng nhóm
-                        continue
-                    } else if err.isQuotaExceeded {
-                        // Hết quota trên model hiện tại -> chuyển sang nhóm model dự phòng (ví dụ 3.5 -> 3.1)
-                        break
-                    } else {
-                        throw GeminiServiceError.apiError(err.message)
+                // Thử tối đa 3 lần cho mỗi endpoint nếu máy chủ Google báo quá tải tạm thời (503 High Demand / Overloaded)
+                for attempt in 1...3 {
+                    do {
+                        let resultText = try await callGenerateContent(
+                            endpointModel: endpointModel,
+                            apiKey: cleanKey,
+                            systemInstruction: instruction,
+                            userContent: trimmedContent
+                        )
+                        return GeminiTranslationOutcome(
+                            translatedText: resultText,
+                            usedModelChoice: choice,
+                            actualEndpointModel: endpointModel,
+                            didAutoSwitchToFallback: choiceIndex > 0
+                        )
+                    } catch let err as InternalCallError {
+                        lastErrorMessage = err.message
+
+                        if err.isModelNotFound {
+                            // Model ID này không tồn tại trên endpoint -> chuyển ngay sang candidate tiếp theo
+                            break
+                        } else if err.isServerOverloaded {
+                            // Lỗi "This model is currently experiencing high demand..." (HTTP 503 / UNAVAILABLE)
+                            // Chờ 1.5s - 3s rồi thử lại, nếu vẫn quá tải thì thử sang model dự phòng tiếp theo
+                            if attempt < 2 {
+                                try? await Task.sleep(nanoseconds: UInt64(attempt) * 1_600_000_000)
+                                continue
+                            } else {
+                                break
+                            }
+                        } else if err.isQuotaExceeded {
+                            // Hết quota (HTTP 429) -> thử sang model tiếp theo
+                            break
+                        } else {
+                            throw GeminiServiceError.apiError(err.message)
+                        }
+                    } catch {
+                        lastErrorMessage = error.localizedDescription
+                        if attempt < 2 {
+                            try? await Task.sleep(nanoseconds: 1_200_000_000)
+                            continue
+                        } else {
+                            break
+                        }
                     }
-                } catch {
-                    lastErrorMessage = error.localizedDescription
                 }
             }
         }
@@ -109,6 +127,7 @@ final class GeminiService {
         let statusCode: Int
         let message: String
         let isQuotaExceeded: Bool
+        let isServerOverloaded: Bool
         let isModelNotFound: Bool
     }
 
@@ -120,7 +139,13 @@ final class GeminiService {
     ) async throws -> String {
         let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(endpointModel):generateContent?key=\(apiKey)"
         guard let url = URL(string: urlString) else {
-            throw InternalCallError(statusCode: 400, message: "URL Gemini không hợp lệ.", isQuotaExceeded: false, isModelNotFound: false)
+            throw InternalCallError(
+                statusCode: 400,
+                message: "URL Gemini không hợp lệ.",
+                isQuotaExceeded: false,
+                isServerOverloaded: false,
+                isModelNotFound: false
+            )
         }
 
         let promptPayload = """
@@ -156,8 +181,23 @@ final class GeminiService {
         if !(200...299).contains(statusCode) {
             let rawText = String(data: data, encoding: .utf8) ?? ""
             let lower = rawText.lowercased()
-            let isQuota = statusCode == 429 || lower.contains("quota") || lower.contains("resource_exhausted") || lower.contains("rate limit")
-            let isNotFound = statusCode == 404 || lower.contains("not found") || lower.contains("not supported")
+
+            let isQuota = statusCode == 429 ||
+                lower.contains("quota") ||
+                lower.contains("resource_exhausted") ||
+                lower.contains("rate limit")
+
+            let isOverloaded = statusCode == 503 ||
+                statusCode == 502 ||
+                statusCode == 504 ||
+                lower.contains("high demand") ||
+                lower.contains("overloaded") ||
+                lower.contains("unavailable") ||
+                lower.contains("try again later")
+
+            let isNotFound = statusCode == 404 ||
+                lower.contains("not found") ||
+                lower.contains("not supported")
 
             var parsedError = "Lỗi Gemini API (HTTP \(statusCode))"
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -170,6 +210,7 @@ final class GeminiService {
                 statusCode: statusCode,
                 message: parsedError,
                 isQuotaExceeded: isQuota,
+                isServerOverloaded: isOverloaded,
                 isModelNotFound: isNotFound
             )
         }
@@ -179,12 +220,24 @@ final class GeminiService {
               let firstCandidate = candidates.first,
               let content = firstCandidate["content"] as? [String: Any],
               let parts = content["parts"] as? [[String: Any]] else {
-            throw InternalCallError(statusCode: 500, message: "Phản hồi từ Gemini không đúng định dạng.", isQuotaExceeded: false, isModelNotFound: false)
+            throw InternalCallError(
+                statusCode: 500,
+                message: "Phản hồi từ Gemini không đúng định dạng.",
+                isQuotaExceeded: false,
+                isServerOverloaded: false,
+                isModelNotFound: false
+            )
         }
 
         let combinedText = parts.compactMap { $0["text"] as? String }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !combinedText.isEmpty else {
-            throw InternalCallError(statusCode: 500, message: "Gemini trả về nội dung rỗng.", isQuotaExceeded: false, isModelNotFound: false)
+            throw InternalCallError(
+                statusCode: 500,
+                message: "Gemini trả về nội dung rỗng.",
+                isQuotaExceeded: false,
+                isServerOverloaded: false,
+                isModelNotFound: false
+            )
         }
 
         return combinedText
