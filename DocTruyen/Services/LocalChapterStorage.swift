@@ -15,7 +15,9 @@ final class LocalChapterStorage {
     private let chaptersDirectory: URL
     private let foldersCacheDirectory: URL
     private let metadataFileURL: URL
+    private let customTitlesFileURL: URL
     private var translatedChapterIds: Set<String> = []
+    private var customChapterTitles: [String: String] = [:]
     private let queue = DispatchQueue(label: "com.anhhai.doctruyen.storage", attributes: .concurrent)
 
     private init() {
@@ -23,6 +25,7 @@ final class LocalChapterStorage {
         chaptersDirectory = docs.appendingPathComponent("ChaptersStorage", isDirectory: true)
         foldersCacheDirectory = docs.appendingPathComponent("FoldersDiskCache", isDirectory: true)
         metadataFileURL = docs.appendingPathComponent("TranslatedChaptersMeta.json")
+        customTitlesFileURL = docs.appendingPathComponent("CustomChapterTitlesMeta.json")
 
         if !fileManager.fileExists(atPath: chaptersDirectory.path) {
             try? fileManager.createDirectory(at: chaptersDirectory, withIntermediateDirectories: true)
@@ -34,11 +37,14 @@ final class LocalChapterStorage {
     }
 
     private func loadMetadata() {
-        guard let data = try? Data(contentsOf: metadataFileURL),
-              let ids = try? JSONDecoder().decode([String].self, from: data) else {
-            return
+        if let data = try? Data(contentsOf: metadataFileURL),
+           let ids = try? JSONDecoder().decode([String].self, from: data) {
+            translatedChapterIds = Set(ids)
         }
-        translatedChapterIds = Set(ids)
+        if let titleData = try? Data(contentsOf: customTitlesFileURL),
+           let titles = try? JSONDecoder().decode([String: String].self, from: titleData) {
+            customChapterTitles = titles
+        }
     }
 
     private func saveMetadata() {
@@ -46,11 +52,32 @@ final class LocalChapterStorage {
         if let data = try? JSONEncoder().encode(array) {
             try? data.write(to: metadataFileURL, options: .atomic)
         }
+        if let titleData = try? JSONEncoder().encode(customChapterTitles) {
+            try? titleData.write(to: customTitlesFileURL, options: .atomic)
+        }
     }
 
     private func sanitizedIdentifier(_ rawId: String) -> String {
         let safe = rawId.replacingOccurrences(of: "[^a-zA-Z0-9_-]", with: "_", options: .regularExpression)
         return safe.isEmpty ? "default_root" : safe
+    }
+
+    // MARK: - Custom Chapter Titles (Đổi tên chương khi trùng tên truyện)
+    func customTitle(for chapterId: String) -> String? {
+        queue.sync {
+            customChapterTitles[chapterId]
+        }
+    }
+
+    func setCustomTitle(_ newTitle: String?, for chapterId: String) {
+        queue.async(flags: .barrier) {
+            if let newTitle, !newTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.customChapterTitles[chapterId] = newTitle
+            } else {
+                self.customChapterTitles.removeValue(forKey: chapterId)
+            }
+            self.saveMetadata()
+        }
     }
 
     // MARK: - Chapter Content Disk Storage
@@ -75,14 +102,23 @@ final class LocalChapterStorage {
         return try? String(contentsOf: url, encoding: .utf8)
     }
 
-    /// Ghi đè nội dung của file cũ bằng nội dung mới (hoặc nội dung đã dịch)
-    func overwriteChapterFile(chapterId: String, chapterName: String? = nil, content: String, markAsTranslated: Bool) throws {
+    /// Ghi đè nội dung của file cũ bằng nội dung mới (hoặc nội dung đã dịch) và cập nhật tiêu đề chương nếu có
+    func overwriteChapterFile(
+        chapterId: String,
+        chapterName: String? = nil,
+        content: String,
+        markAsTranslated: Bool,
+        updatedChapterTitle: String? = nil
+    ) throws {
         let url = fileURL(for: chapterId, chapterName: chapterName)
         try content.write(to: url, atomically: true, encoding: .utf8)
 
         queue.async(flags: .barrier) {
             if markAsTranslated {
                 self.translatedChapterIds.insert(chapterId)
+            }
+            if let updatedChapterTitle, !updatedChapterTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.customChapterTitles[chapterId] = updatedChapterTitle
             }
             self.saveMetadata()
         }
@@ -93,6 +129,7 @@ final class LocalChapterStorage {
         try? fileManager.removeItem(at: url)
         queue.async(flags: .barrier) {
             self.translatedChapterIds.remove(chapterId)
+            self.customChapterTitles.removeValue(forKey: chapterId)
             self.saveMetadata()
         }
     }
@@ -103,7 +140,7 @@ final class LocalChapterStorage {
         }
     }
 
-    // MARK: - Folder & Chapter List Disk Cache (Không cần tải lại từ Drive khi mở lại app)
+    // MARK: - Folder & Chapter List Disk Cache
     private func folderCacheFileURL(for folderId: String) -> URL {
         let fileName = "\(sanitizedIdentifier(folderId)).json"
         return foldersCacheDirectory.appendingPathComponent(fileName)
