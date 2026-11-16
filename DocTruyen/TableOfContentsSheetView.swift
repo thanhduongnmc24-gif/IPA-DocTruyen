@@ -78,6 +78,25 @@ struct TableOfContentsSheetView: View {
                             .foregroundStyle(palette.primaryText)
                         }
                     }
+
+                    // Chỉnh tốc độ tự động cuộn ngay trong bảng Mục lục / Tùy chỉnh đọc (để màn hình đọc hoàn toàn sạch sẽ)
+                    VStack(spacing: 6) {
+                        HStack(spacing: 8) {
+                            Label("Tốc độ cuộn: \(Int(viewModel.autoScrollSpeed))", systemImage: "arrow.down.circle")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(palette.primaryText)
+
+                            Slider(value: $viewModel.autoScrollSpeed, in: 15...160, step: 5)
+                                .tint(palette.accent)
+                        }
+
+                        Toggle(isOn: $viewModel.autoNextChapterOnScrollEnd) {
+                            Text("Cuộn hết trang tự qua chương mới")
+                                .font(.caption)
+                                .foregroundStyle(palette.secondaryText)
+                        }
+                        .tint(palette.accent)
+                    }
                 }
                 .padding(14)
                 .background(palette.headerBackground)
@@ -128,6 +147,7 @@ struct TableOfContentsSheetView: View {
                 .padding(.vertical, 10)
                 .background(palette.background)
 
+                // Danh sách chương trong cụm: Tự động tạo mới ScrollView và cuộn lên đầu trang khi bấm sang cụm chương khác
                 ScrollViewReader { scrollProxy in
                     ScrollView {
                         LazyVStack(spacing: 8) {
@@ -139,7 +159,6 @@ struct TableOfContentsSheetView: View {
                                 let globalIndex = viewModel.tocStartIndex + offset
                                 let isCurrent = viewModel.selectedChapter?.id == chapter.id
                                 let isTranslated = LocalChapterStorage.shared.isChapterTranslated(chapter.id)
-                                let isSynced = LocalChapterStorage.shared.isChapterSyncedToDrive(chapter.id)
 
                                 Button {
                                     dismiss()
@@ -163,15 +182,7 @@ struct TableOfContentsSheetView: View {
 
                                         Spacer()
 
-                                        if isSynced {
-                                            Text("Đã lên Drive")
-                                                .font(.system(size: 10, weight: .bold))
-                                                .padding(.horizontal, 8)
-                                                .padding(.vertical, 4)
-                                                .background(Color.blue.opacity(0.18))
-                                                .foregroundStyle(Color.blue)
-                                                .clipShape(Capsule())
-                                        } else if isTranslated {
+                                        if isTranslated {
                                             Text("Đã dịch AI")
                                                 .font(.system(size: 10, weight: .bold))
                                                 .padding(.horizontal, 8)

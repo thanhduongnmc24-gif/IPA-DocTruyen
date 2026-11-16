@@ -33,7 +33,7 @@ struct ContentView: View {
                 }
             }
 
-            if viewModel.screenMode == .reader && (viewModel.showAutoScrollControls || viewModel.showSpeechControls) {
+            if viewModel.screenMode == .reader && viewModel.showSpeechControls {
                 readerFloatingUtilityBar(palette: palette)
                     .padding(.horizontal, 12)
                     .padding(.bottom, 10)
@@ -42,7 +42,7 @@ struct ContentView: View {
 
             if !viewModel.toastMessage.isEmpty {
                 toastCapsule
-                    .padding(.bottom, viewModel.screenMode == .reader ? 84 : 24)
+                    .padding(.bottom, (viewModel.screenMode == .reader && viewModel.showSpeechControls) ? 88 : 24)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
@@ -60,162 +60,120 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Thanh điều khiển nổi Tự động cuộn & Nghe truyện
+    // MARK: - Thanh điều khiển nổi Nghe truyện AI (Đã ẩn hoàn toàn thanh cuộn khi tự động cuộn)
     @ViewBuilder
     private func readerFloatingUtilityBar(palette: ThemePalette) -> some View {
         VStack(spacing: 8) {
-            if viewModel.showSpeechControls {
-                HStack(spacing: 10) {
-                    Button {
-                        speechManager.skipBackwardChunk()
-                    } label: {
-                        Image(systemName: "gobackward.10")
-                            .font(.system(size: 14, weight: .bold))
-                            .frame(width: 30, height: 30)
-                            .background(palette.accent.opacity(0.14))
-                            .foregroundStyle(palette.accent)
-                            .clipShape(Circle())
+            HStack(spacing: 8) {
+                Button {
+                    speechManager.skipBackwardChunk()
+                } label: {
+                    Image(systemName: "gobackward.10")
+                        .font(.system(size: 13, weight: .bold))
+                        .frame(width: 28, height: 28)
+                        .background(palette.accent.opacity(0.14))
+                        .foregroundStyle(palette.accent)
+                        .clipShape(Circle())
+                }
+
+                Button {
+                    viewModel.toggleSpeechPlayback()
+                } label: {
+                    Group {
+                        if speechManager.isBuffering {
+                            ProgressView()
+                                .tint(.white)
+                                .scaleEffect(0.8)
+                        } else {
+                            Image(systemName: (speechManager.isSpeaking && !speechManager.isPaused) ? "pause.fill" : "play.fill")
+                                .font(.system(size: 14, weight: .bold))
+                        }
                     }
+                    .frame(width: 34, height: 34)
+                    .background(palette.accent)
+                    .foregroundStyle(.white)
+                    .clipShape(Circle())
+                }
 
-                    Button {
-                        viewModel.toggleSpeechPlayback()
-                    } label: {
-                        Image(systemName: (speechManager.isSpeaking && !speechManager.isPaused) ? "pause.fill" : "play.fill")
-                            .font(.system(size: 14, weight: .bold))
-                            .frame(width: 36, height: 36)
-                            .background(palette.accent)
-                            .foregroundStyle(.white)
-                            .clipShape(Circle())
+                Button {
+                    speechManager.skipForwardChunk()
+                } label: {
+                    Image(systemName: "goforward.10")
+                        .font(.system(size: 13, weight: .bold))
+                        .frame(width: 28, height: 28)
+                        .background(palette.accent.opacity(0.14))
+                        .foregroundStyle(palette.accent)
+                        .clipShape(Circle())
+                }
+
+                Menu {
+                    ForEach(StoryVoiceChoice.allCases) { voice in
+                        Button {
+                            speechManager.selectedVoiceChoice = voice
+                        } label: {
+                            if speechManager.selectedVoiceChoice == voice {
+                                Label(voice.displayName, systemImage: "checkmark")
+                            } else {
+                                Text(voice.displayName)
+                            }
+                        }
                     }
-
-                    Button {
-                        speechManager.skipForwardChunk()
-                    } label: {
-                        Image(systemName: "goforward.10")
-                            .font(.system(size: 14, weight: .bold))
-                            .frame(width: 30, height: 30)
-                            .background(palette.accent.opacity(0.14))
-                            .foregroundStyle(palette.accent)
-                            .clipShape(Circle())
-                    }
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(speechManager.isPaused ? "Đang tạm dừng nghe" : "Đang nghe truyện")
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundStyle(palette.primaryText)
-                            .lineLimit(1)
-
+                } label: {
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 3) {
+                            Text(speechManager.selectedVoiceChoice.shortName)
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(palette.primaryText)
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(palette.accent)
+                        }
                         Text("Đoạn \(min(speechManager.currentChunkIndex + 1, max(speechManager.totalChunks, 1)))/\(max(speechManager.totalChunks, 1))")
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(palette.secondaryText)
                     }
+                }
 
-                    Spacer(minLength: 4)
+                Spacer(minLength: 4)
 
-                    HStack(spacing: 4) {
-                        Button {
-                            speechManager.adjustSpeed(delta: -0.1)
-                        } label: {
-                            Text("-")
-                                .font(.system(size: 13, weight: .bold))
-                                .frame(width: 24, height: 24)
-                                .background(palette.accent.opacity(0.14))
-                                .foregroundStyle(palette.accent)
-                                .clipShape(Circle())
-                        }
-
-                        Text(String(format: "%.1fx", speechManager.playbackSpeedMultiplier))
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundStyle(palette.primaryText)
-                            .frame(width: 34)
-
-                        Button {
-                            speechManager.adjustSpeed(delta: 0.1)
-                        } label: {
-                            Text("+")
-                                .font(.system(size: 13, weight: .bold))
-                                .frame(width: 24, height: 24)
-                                .background(palette.accent.opacity(0.14))
-                                .foregroundStyle(palette.accent)
-                                .clipShape(Circle())
-                        }
+                HStack(spacing: 4) {
+                    Button {
+                        speechManager.adjustSpeed(delta: -0.1)
+                    } label: {
+                        Text("-")
+                            .font(.system(size: 13, weight: .bold))
+                            .frame(width: 24, height: 24)
+                            .background(palette.accent.opacity(0.14))
+                            .foregroundStyle(palette.accent)
+                            .clipShape(Circle())
                     }
 
+                    Text(String(format: "%.1fx", speechManager.playbackSpeedMultiplier))
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundStyle(palette.primaryText)
+                        .frame(width: 34)
+
                     Button {
-                        viewModel.stopSpeechPlayback()
+                        speechManager.adjustSpeed(delta: 0.1)
                     } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 11, weight: .bold))
-                            .frame(width: 26, height: 26)
-                            .background(Color.secondary.opacity(0.16))
-                            .foregroundStyle(palette.secondaryText)
+                        Text("+")
+                            .font(.system(size: 13, weight: .bold))
+                            .frame(width: 24, height: 24)
+                            .background(palette.accent.opacity(0.14))
+                            .foregroundStyle(palette.accent)
                             .clipShape(Circle())
                     }
                 }
-            } else if viewModel.showAutoScrollControls {
-                VStack(spacing: 6) {
-                    HStack(spacing: 10) {
-                        Button {
-                            viewModel.isAutoScrolling.toggle()
-                        } label: {
-                            Image(systemName: viewModel.isAutoScrolling ? "pause.fill" : "play.fill")
-                                .font(.system(size: 14, weight: .bold))
-                                .frame(width: 34, height: 34)
-                                .background(palette.accent)
-                                .foregroundStyle(.white)
-                                .clipShape(Circle())
-                        }
 
-                        Button {
-                            viewModel.adjustAutoScrollSpeed(delta: -10)
-                        } label: {
-                            Image(systemName: "tortoise.fill")
-                                .font(.system(size: 11, weight: .bold))
-                                .frame(width: 28, height: 28)
-                                .background(palette.accent.opacity(0.14))
-                                .foregroundStyle(palette.accent)
-                                .clipShape(Circle())
-                        }
-
-                        Slider(value: $viewModel.autoScrollSpeed, in: 15...160, step: 5)
-                            .tint(palette.accent)
-
-                        Button {
-                            viewModel.adjustAutoScrollSpeed(delta: 10)
-                        } label: {
-                            Image(systemName: "hare.fill")
-                                .font(.system(size: 11, weight: .bold))
-                                .frame(width: 28, height: 28)
-                                .background(palette.accent.opacity(0.14))
-                                .foregroundStyle(palette.accent)
-                                .clipShape(Circle())
-                        }
-
-                        Text("\(Int(viewModel.autoScrollSpeed))")
-                            .font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundStyle(palette.primaryText)
-                            .frame(width: 28)
-
-                        Button {
-                            viewModel.stopAutoScroll()
-                        } label: {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 11, weight: .bold))
-                                .frame(width: 26, height: 26)
-                                .background(Color.secondary.opacity(0.16))
-                                .foregroundStyle(palette.secondaryText)
-                                .clipShape(Circle())
-                        }
-                    }
-
-                    HStack {
-                        Toggle(isOn: $viewModel.autoNextChapterOnScrollEnd) {
-                            Text("Cuộn hết trang tự qua chương mới")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(palette.secondaryText)
-                        }
-                        .tint(palette.accent)
-                    }
+                Button {
+                    viewModel.stopSpeechPlayback()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .frame(width: 26, height: 26)
+                        .background(Color.secondary.opacity(0.16))
+                        .foregroundStyle(palette.secondaryText)
+                        .clipShape(Circle())
                 }
             }
         }
@@ -923,7 +881,7 @@ struct ContentView: View {
                             .disabled(viewModel.currentChapterIndex >= viewModel.chapters.count - 1)
                         }
                         .padding(.top, 6)
-                        .padding(.bottom, (viewModel.showAutoScrollControls || viewModel.showSpeechControls) ? 105 : 26)
+                        .padding(.bottom, viewModel.showSpeechControls ? 86 : 26)
                     }
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
