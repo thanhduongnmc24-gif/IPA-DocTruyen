@@ -3,6 +3,7 @@ import UIKit
 
 struct ContentView: View {
     @StateObject private var viewModel = AppViewModel()
+    @ObservedObject private var speechManager = StorySpeechManager.shared
 
     var body: some View {
         let palette = ThemePalette.forTheme(viewModel.readerTheme)
@@ -32,13 +33,22 @@ struct ContentView: View {
                 }
             }
 
+            if viewModel.screenMode == .reader && (viewModel.showAutoScrollControls || viewModel.showSpeechControls) {
+                readerFloatingUtilityBar(palette: palette)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 10)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
             if !viewModel.toastMessage.isEmpty {
                 toastCapsule
-                    .padding(.bottom, viewModel.screenMode == .reader ? 68 : 24)
+                    .padding(.bottom, viewModel.screenMode == .reader ? 84 : 24)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .animation(.easeInOut(duration: 0.2), value: viewModel.toastMessage)
+        .animation(.easeInOut(duration: 0.2), value: viewModel.showAutoScrollControls)
+        .animation(.easeInOut(duration: 0.2), value: viewModel.showSpeechControls)
         .sheet(isPresented: $viewModel.showSettingsSheet) {
             SettingsSheetView(viewModel: viewModel)
         }
@@ -50,7 +60,177 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Top Navigation Header (Đã bỏ dòng chữ "Đang dịch..." và bỏ "Thư viện truyện / Kho truyện Google Drive...")
+    // MARK: - Thanh điều khiển nổi Tự động cuộn & Nghe truyện
+    @ViewBuilder
+    private func readerFloatingUtilityBar(palette: ThemePalette) -> some View {
+        VStack(spacing: 8) {
+            if viewModel.showSpeechControls {
+                HStack(spacing: 10) {
+                    Button {
+                        speechManager.skipBackwardChunk()
+                    } label: {
+                        Image(systemName: "gobackward.10")
+                            .font(.system(size: 14, weight: .bold))
+                            .frame(width: 30, height: 30)
+                            .background(palette.accent.opacity(0.14))
+                            .foregroundStyle(palette.accent)
+                            .clipShape(Circle())
+                    }
+
+                    Button {
+                        viewModel.toggleSpeechPlayback()
+                    } label: {
+                        Image(systemName: (speechManager.isSpeaking && !speechManager.isPaused) ? "pause.fill" : "play.fill")
+                            .font(.system(size: 14, weight: .bold))
+                            .frame(width: 36, height: 36)
+                            .background(palette.accent)
+                            .foregroundStyle(.white)
+                            .clipShape(Circle())
+                    }
+
+                    Button {
+                        speechManager.skipForwardChunk()
+                    } label: {
+                        Image(systemName: "goforward.10")
+                            .font(.system(size: 14, weight: .bold))
+                            .frame(width: 30, height: 30)
+                            .background(palette.accent.opacity(0.14))
+                            .foregroundStyle(palette.accent)
+                            .clipShape(Circle())
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(speechManager.isPaused ? "Đang tạm dừng nghe" : "Đang nghe truyện")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(palette.primaryText)
+                            .lineLimit(1)
+
+                        Text("Đoạn \(min(speechManager.currentChunkIndex + 1, max(speechManager.totalChunks, 1)))/\(max(speechManager.totalChunks, 1))")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(palette.secondaryText)
+                    }
+
+                    Spacer(minLength: 4)
+
+                    HStack(spacing: 4) {
+                        Button {
+                            speechManager.adjustSpeed(delta: -0.1)
+                        } label: {
+                            Text("-")
+                                .font(.system(size: 13, weight: .bold))
+                                .frame(width: 24, height: 24)
+                                .background(palette.accent.opacity(0.14))
+                                .foregroundStyle(palette.accent)
+                                .clipShape(Circle())
+                        }
+
+                        Text(String(format: "%.1fx", speechManager.playbackSpeedMultiplier))
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundStyle(palette.primaryText)
+                            .frame(width: 34)
+
+                        Button {
+                            speechManager.adjustSpeed(delta: 0.1)
+                        } label: {
+                            Text("+")
+                                .font(.system(size: 13, weight: .bold))
+                                .frame(width: 24, height: 24)
+                                .background(palette.accent.opacity(0.14))
+                                .foregroundStyle(palette.accent)
+                                .clipShape(Circle())
+                        }
+                    }
+
+                    Button {
+                        viewModel.stopSpeechPlayback()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 11, weight: .bold))
+                            .frame(width: 26, height: 26)
+                            .background(Color.secondary.opacity(0.16))
+                            .foregroundStyle(palette.secondaryText)
+                            .clipShape(Circle())
+                    }
+                }
+            } else if viewModel.showAutoScrollControls {
+                VStack(spacing: 6) {
+                    HStack(spacing: 10) {
+                        Button {
+                            viewModel.isAutoScrolling.toggle()
+                        } label: {
+                            Image(systemName: viewModel.isAutoScrolling ? "pause.fill" : "play.fill")
+                                .font(.system(size: 14, weight: .bold))
+                                .frame(width: 34, height: 34)
+                                .background(palette.accent)
+                                .foregroundStyle(.white)
+                                .clipShape(Circle())
+                        }
+
+                        Button {
+                            viewModel.adjustAutoScrollSpeed(delta: -10)
+                        } label: {
+                            Image(systemName: "tortoise.fill")
+                                .font(.system(size: 11, weight: .bold))
+                                .frame(width: 28, height: 28)
+                                .background(palette.accent.opacity(0.14))
+                                .foregroundStyle(palette.accent)
+                                .clipShape(Circle())
+                        }
+
+                        Slider(value: $viewModel.autoScrollSpeed, in: 15...160, step: 5)
+                            .tint(palette.accent)
+
+                        Button {
+                            viewModel.adjustAutoScrollSpeed(delta: 10)
+                        } label: {
+                            Image(systemName: "hare.fill")
+                                .font(.system(size: 11, weight: .bold))
+                                .frame(width: 28, height: 28)
+                                .background(palette.accent.opacity(0.14))
+                                .foregroundStyle(palette.accent)
+                                .clipShape(Circle())
+                        }
+
+                        Text("\(Int(viewModel.autoScrollSpeed))")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundStyle(palette.primaryText)
+                            .frame(width: 28)
+
+                        Button {
+                            viewModel.stopAutoScroll()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 11, weight: .bold))
+                                .frame(width: 26, height: 26)
+                                .background(Color.secondary.opacity(0.16))
+                                .foregroundStyle(palette.secondaryText)
+                                .clipShape(Circle())
+                        }
+                    }
+
+                    HStack {
+                        Toggle(isOn: $viewModel.autoNextChapterOnScrollEnd) {
+                            Text("Cuộn hết trang tự qua chương mới")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(palette.secondaryText)
+                        }
+                        .tint(palette.accent)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(.ultraThinMaterial)
+        .overlay(
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(palette.border, lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 18))
+        .shadow(color: Color.black.opacity(0.12), radius: 10, x: 0, y: 4)
+    }
+
+    // MARK: - Top Navigation Header
     @ViewBuilder
     private func headerBar(palette: ThemePalette) -> some View {
         if viewModel.screenMode == .reader {
@@ -62,7 +242,7 @@ struct ContentView: View {
                 LocalChapterStorage.shared.isChapterSyncedToDrive($0.id)
             } ?? false
 
-            HStack(spacing: 6) {
+            HStack(spacing: 5) {
                 Button {
                     Task { await viewModel.navigateBack() }
                 } label: {
@@ -93,8 +273,32 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 Text("\(max(viewModel.currentChapterIndex + 1, 1))/\(viewModel.chapters.count)")
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
                     .foregroundStyle(palette.secondaryText)
+
+                // Nút Tự động cuộn
+                Button {
+                    viewModel.toggleAutoScroll()
+                } label: {
+                    Image(systemName: viewModel.isAutoScrolling ? "arrow.down.circle.fill" : "arrow.down.circle")
+                        .font(.system(size: 13, weight: .bold))
+                        .frame(width: 28, height: 28)
+                        .background(viewModel.isAutoScrolling ? palette.accent : palette.accent.opacity(0.14))
+                        .foregroundStyle(viewModel.isAutoScrolling ? .white : palette.accent)
+                        .clipShape(Circle())
+                }
+
+                // Nút Nghe truyện
+                Button {
+                    viewModel.toggleSpeechPlayback()
+                } label: {
+                    Image(systemName: speechManager.isSpeaking ? "speaker.wave.2.fill" : "headphones")
+                        .font(.system(size: 12, weight: .bold))
+                        .frame(width: 28, height: 28)
+                        .background(speechManager.isSpeaking ? palette.accent : palette.accent.opacity(0.14))
+                        .foregroundStyle(speechManager.isSpeaking ? .white : palette.accent)
+                        .clipShape(Circle())
+                }
 
                 Button {
                     viewModel.prepareAndOpenTranslationPopup()
@@ -108,7 +312,7 @@ struct ContentView: View {
                             .font(.system(size: 11, weight: .bold))
                     }
                     .fixedSize(horizontal: true, vertical: false)
-                    .padding(.horizontal, 9)
+                    .padding(.horizontal, 8)
                     .padding(.vertical, 5)
                     .background(
                         LinearGradient(
@@ -153,7 +357,6 @@ struct ContentView: View {
                 alignment: .bottom
             )
         } else if viewModel.screenMode == .folders && !viewModel.canNavigateBack {
-            // Màn hình danh sách bộ truyện ở thư mục gốc: Gọn gàng trên 1 hàng duy nhất (Không có chữ "Thư viện truyện / Kho truyện Google Drive...")
             HStack(spacing: 10) {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass")
@@ -212,7 +415,6 @@ struct ContentView: View {
                 alignment: .bottom
             )
         } else {
-            // Màn hình danh sách chương của 1 bộ truyện (hoặc thư mục con)
             let _ = viewModel.translatedRevisionTrigger
             VStack(spacing: 10) {
                 HStack(spacing: 10) {
@@ -611,6 +813,28 @@ struct ContentView: View {
             ScrollViewReader { scrollProxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 14) {
+                        AutoScrollBridge(
+                            isScrolling: viewModel.isAutoScrolling,
+                            speedPointsPerSecond: viewModel.autoScrollSpeed,
+                            onUserDragPause: {
+                                viewModel.isAutoScrolling = false
+                            },
+                            onReachedBottom: {
+                                viewModel.isAutoScrolling = false
+                                if viewModel.autoNextChapterOnScrollEnd &&
+                                    viewModel.currentChapterIndex < viewModel.chapters.count - 1 {
+                                    Task {
+                                        try? await Task.sleep(nanoseconds: 1_200_000_000)
+                                        await viewModel.openNextChapter()
+                                        if viewModel.showAutoScrollControls {
+                                            viewModel.isAutoScrolling = true
+                                        }
+                                    }
+                                }
+                            }
+                        )
+                        .frame(width: 0, height: 0)
+
                         Color.clear
                             .frame(height: 1)
                             .id("READER_TOP_ANCHOR")
@@ -699,7 +923,7 @@ struct ContentView: View {
                             .disabled(viewModel.currentChapterIndex >= viewModel.chapters.count - 1)
                         }
                         .padding(.top, 6)
-                        .padding(.bottom, 26)
+                        .padding(.bottom, (viewModel.showAutoScrollControls || viewModel.showSpeechControls) ? 105 : 26)
                     }
                     .padding(.horizontal, 16)
                     .padding(.top, 8)

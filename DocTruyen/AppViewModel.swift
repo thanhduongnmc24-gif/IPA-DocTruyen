@@ -80,6 +80,8 @@ final class AppViewModel: ObservableObject {
     private let driveAppsScriptUrlStorageKey = "DOC_TRUYEN_DRIVE_APPS_SCRIPT_URL"
     private let fontSizeStorageKey = "DOC_TRUYEN_STORY_FONT_SIZE"
     private let readerThemeStorageKey = "DOC_TRUYEN_READER_THEME"
+    private let autoScrollSpeedStorageKey = "DOC_TRUYEN_AUTO_SCROLL_SPEED"
+    private let autoNextOnScrollEndStorageKey = "DOC_TRUYEN_AUTO_NEXT_ON_SCROLL_END"
 
     // MARK: - Navigation & Data State
     @Published var screenMode: ScreenMode = .folders
@@ -112,6 +114,20 @@ final class AppViewModel: ObservableObject {
     @Published var nextSwipePromptVisible: Bool = false
     @Published var readingStates: [String: StoryReadingState] = [:]
     @Published var lastReadingFolderId: String?
+
+    // MARK: - Auto-Scroll & Text-to-Speech (Nghe truyện)
+    @Published var isAutoScrolling: Bool = false {
+        didSet { updateKeepAwakeState() }
+    }
+    @Published var showAutoScrollControls: Bool = false
+    /// Tốc độ cuộn tính bằng point/giây (15 -> 160 pt/s, mặc định 45 pt/s)
+    @Published var autoScrollSpeed: Double = 45 {
+        didSet { UserDefaults.standard.set(autoScrollSpeed, forKey: autoScrollSpeedStorageKey) }
+    }
+    @Published var autoNextChapterOnScrollEnd: Bool = true {
+        didSet { UserDefaults.standard.set(autoNextChapterOnScrollEnd, forKey: autoNextOnScrollEndStorageKey) }
+    }
+    @Published var showSpeechControls: Bool = false
 
     // MARK: - AI Gemini Translation Settings & Batch State
     @Published var geminiApiKey: String = "" {
@@ -283,6 +299,11 @@ final class AppViewModel: ObservableObject {
 
     init() {
         loadUserPreferences()
+        StorySpeechManager.shared.onChapterFinished = { [weak self] in
+            Task { @MainActor in
+                await self?.handleSpeechChapterFinished()
+            }
+        }
         Task {
             await initializeApp()
         }
@@ -340,10 +361,17 @@ final class AppViewModel: ObservableObject {
            let theme = ReaderTheme(rawValue: savedThemeRaw) {
             readerTheme = theme
         }
+        let savedScrollSpeed = defaults.double(forKey: autoScrollSpeedStorageKey)
+        if savedScrollSpeed >= 15 && savedScrollSpeed <= 160 {
+            autoScrollSpeed = savedScrollSpeed
+        }
+        if defaults.object(forKey: autoNextOnScrollEndStorageKey) != nil {
+            autoNextChapterOnScrollEnd = defaults.bool(forKey: autoNextOnScrollEndStorageKey)
+        }
     }
 
     private func updateKeepAwakeState() {
-        let active = isTranslatingBatch || isSyncingToDrive
+        let active = isTranslatingBatch || isSyncingToDrive || isAutoScrolling || StorySpeechManager.shared.isSpeaking
         UIApplication.shared.isIdleTimerDisabled = active
 
         if active {
@@ -692,6 +720,10 @@ final class AppViewModel: ObservableObject {
         nextSwipePromptVisible = false
 
         if screenMode == .reader {
+            isAutoScrolling = false
+            showAutoScrollControls = false
+            StorySpeechManager.shared.stop()
+            showSpeechControls = false
             saveReadingProgress()
             screenMode = .chapters
             return
@@ -1331,6 +1363,66 @@ final class AppViewModel: ObservableObject {
             showToast("Đã khôi phục bản gốc từ Google Drive")
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - Điều khiển Tự động cuộn & Nghe truyện
+    func toggleAutoScroll() {
+        if isAutoScrolling {
+            isAutoScrolling = false
+        } else {
+            if StorySpeechManager.shared.isSpeaking {
+                StorySpeechManager.shared.stop()
+                showSpeechControls = false
+            }
+            showAutoScrollControls = true
+            isAutoScrolling = true
+        }
+    }
+
+    func stopAutoScroll() {
+        isAutoScrolling = false
+        showAutoScrollControls = false
+    }
+
+    func adjustAutoScrollSpeed(delta: Double) {
+        autoScrollSpeed = min(160, max(15, autoScrollSpeed + delta))
+    }
+
+    func toggleSpeechPlayback() {
+        let speech = StorySpeechManager.shared
+        if speech.isSpeaking {
+            speech.togglePlayPause()
+            showSpeechControls = true
+        } else {
+            isAutoScrolling = false
+            showAutoScrollControls = false
+            showSpeechControls = true
+            let title = selectedChapter?.cleanChapterName ?? ""
+            speech.startSpeaking(title: title, text: chapterContent)
+            updateKeepAwakeState()
+        }
+    }
+
+    func stopSpeechPlayback() {
+        StorySpeechManager.shared.stop()
+        showSpeechControls = false
+        updateKeepAwakeState()
+    }
+
+    func handleSpeechChapterFinished() async {
+        let idx = currentChapterIndex
+        guard idx >= 0, idx + 1 < chapters.count else {
+            showToast("Đã đọc xong chương cuối cùng!")
+            showSpeechControls = false
+            updateKeepAwakeState()
+            return
+        }
+        await openChapter(chapters[idx + 1])
+        if screenMode == .reader && !chapterContent.isEmpty && !isChapterLoading {
+            let title = selectedChapter?.cleanChapterName ?? ""
+            StorySpeechManager.shared.startSpeaking(title: title, text: chapterContent)
+            updateKeepAwakeState()
         }
     }
 }
