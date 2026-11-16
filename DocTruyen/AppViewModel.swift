@@ -49,7 +49,6 @@ private actor BackgroundDriveOverwriteQueue {
             appsScriptWebAppUrl: job.appsScriptWebAppUrl,
             accessToken: job.accessToken
         )
-        // Nhịp nghỉ ngắn 200ms giữa các lần gọi Apps Script trên mỗi luồng upload
         try? await Task.sleep(nanoseconds: 200_000_000)
         return result
     }
@@ -189,7 +188,6 @@ final class AppViewModel: ObservableObject {
     private var backgroundTaskId: UIBackgroundTaskIdentifier = .invalid
     private let driveUploadQueue = BackgroundDriveOverwriteQueue()
 
-    /// Số luồng dịch AI chạy song song cùng lúc (Phương án 4: Dual-Worker = 2 chương cùng lúc)
     private let maxConcurrentTranslationWorkers: Int = 2
 
     let tocWindowSize = 50
@@ -494,12 +492,19 @@ final class AppViewModel: ObservableObject {
     }
 
     func refreshCurrentFolder() async {
-        folderCache.removeValue(forKey: currentFolder.id)
-        LocalChapterStorage.shared.clearFolderDiskCache(folderId: currentFolder.id)
+        if screenMode == .folders {
+            // Khi vuốt làm mới ở danh sách truyện bên ngoài -> Xóa toàn bộ cache danh sách chương của tất cả bộ truyện
+            // để khi bấm vào bất kỳ bộ truyện nào cũng tải đủ 100% số chương mới nhất từ Google Drive.
+            folderCache.removeAll()
+            LocalChapterStorage.shared.clearFolderDiskCache()
+        } else {
+            folderCache.removeValue(forKey: currentFolder.id)
+            LocalChapterStorage.shared.clearFolderDiskCache(folderId: currentFolder.id)
+        }
         _ = await loadFolder(currentFolder, forceRefreshFromDrive: true)
+        showToast("Đã đồng bộ dữ liệu mới nhất từ Google Drive")
     }
 
-    // MARK: - Tự động quét & tải ảnh bìa cho từng thư mục truyện
     private func ensureFolderCoversLoaded(for targetFolders: [DriveItem], parentFolderId: String) {
         let missingFolders = targetFolders.filter { item in
             !LocalChapterStorage.shared.hasCachedCoverImage(for: item.id) &&
@@ -939,10 +944,6 @@ final class AppViewModel: ObservableObject {
         )
     }
 
-    /// Kết hợp Phương án 1 + Phương án 4:
-    /// - Phương án 4 (Dual-Worker): Chạy 2 luồng dịch Gemini song song cùng lúc.
-    /// - Phương án 1 (Decoupled Drive Upload): Ngay khi 1 chương dịch xong và lưu vào máy, worker lập tức dịch chương kế tiếp ngay tức khắc,
-    ///   còn việc đẩy & ghi đè lên Google Drive được tách sang hàng đợi bất đồng bộ chạy song song ở nền.
     private func runTranslationPipeline(
         targetSlice: [DriveItem],
         cleanKey: String,
@@ -966,7 +967,6 @@ final class AppViewModel: ObservableObject {
             var failedChaptersForRetry: [DriveItem] = []
             var pendingUploadTasks: [Task<Void, Never>] = []
 
-            // Hàm đẩy 1 chương đã dịch vào hàng đợi ghi đè Google Drive chạy ngầm (Phương án 1: Không chặn luồng dịch AI)
             let enqueueBackgroundDriveOverwrite: (String, String?, String) -> Void = { [weak self] fileId, newTitle, content in
                 guard let self, self.isCloudOverwriteConfigured else { return }
                 let job = BackgroundDriveOverwriteQueue.UploadJob(
@@ -991,7 +991,6 @@ final class AppViewModel: ObservableObject {
                 pendingUploadTasks.append(uploadTask)
             }
 
-            // VÒNG 1: Dịch song song 2 chương cùng lúc (Dual-Worker) + Tách luồng ghi đè Drive
             var nextIndex = 0
             let workerCount = min(maxConcurrentTranslationWorkers, max(1, targetSlice.count))
 
@@ -1043,7 +1042,6 @@ final class AppViewModel: ObservableObject {
 
                             if let (translatedText, extractedNewTitle) = outcomeTuple {
                                 translatedSuccessCount += 1
-                                // Đẩy ngay sang hàng đợi ghi đè Drive ở nền và lập tức quay vòng dịch chương kế tiếp!
                                 enqueueBackgroundDriveOverwrite(chapter.id, extractedNewTitle, translatedText)
                             } else {
                                 failedChaptersForRetry.append(chapter)
@@ -1056,7 +1054,6 @@ final class AppViewModel: ObservableObject {
                 }
             }
 
-            // VÒNG 2: Tự động dịch lại các chương bị nghẽn mạng tạm thời ở Vòng 1 (nếu có)
             if !failedChaptersForRetry.isEmpty && !Task.isCancelled {
                 translationStatusNote = "Đang tự động thử lại \(failedChaptersForRetry.count) chương bị nghẽn mạng..."
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -1080,7 +1077,6 @@ final class AppViewModel: ObservableObject {
                 }
             }
 
-            // Chờ hàng đợi ghi đè Drive chạy ngầm hoàn tất các chương vừa dịch
             if !pendingUploadTasks.isEmpty && !Task.isCancelled {
                 translationStatusNote = "Đang hoàn tất đồng bộ các chương vừa dịch lên Google Drive..."
                 for task in pendingUploadTasks {
@@ -1089,7 +1085,6 @@ final class AppViewModel: ObservableObject {
                 }
             }
 
-            // VÒNG 3: Quét toàn bộ các chương ĐÃ DỊCH trong truyện nhưng CHƯA GHI ĐÈ lên Drive để đẩy bù 100%
             if isCloudOverwriteConfigured && !Task.isCancelled && !isSyncingToDrive {
                 let remainingUnsynced = LocalChapterStorage.shared.unsyncedTranslatedChapters(in: chapters)
                 if !remainingUnsynced.isEmpty {
@@ -1158,7 +1153,6 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    /// Chỉ thực hiện Tải bản gốc + Gọi Gemini dịch + Lưu vào bộ nhớ máy ngay lập tức (Không đứng chờ Google Drive)
     private func translateSingleChapterLocally(
         chapter: DriveItem,
         storyTitle: String,
@@ -1219,7 +1213,7 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Đồng bộ đẩy toàn bộ chương đã dịch lên Google Drive (Chạy ngầm 2 luồng song song)
+    // MARK: - Đồng bộ đẩy toàn bộ chương đã dịch lên Google Drive
     func syncAllTranslatedChaptersToDrive(onlyUnsynced: Bool = false) async {
         let targetList: [DriveItem]
         if onlyUnsynced {
