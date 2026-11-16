@@ -134,7 +134,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         ]
         if totalChunks > 0 {
             info[MPMediaItemPropertyPlaybackDuration] = Double(totalChunks)
-            info[MPMediaItemPropertyElapsedPlaybackTime] = Double(currentChunkIndex)
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = Double(currentChunkIndex)
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
@@ -288,7 +288,6 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             return
         }
 
-        // Nếu đã tải sẵn đoạn này trong cache -> Phát ngay 0ms!
         if let cachedData = prefetchedAudioCache[chunkIdx] {
             prefetchedAudioCache.removeValue(forKey: chunkIdx)
             playMP3Data(cachedData, voiceLabel: voiceMode.shortName)
@@ -298,7 +297,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
         isBuffering = true
         Task {
-            let audioData = await fetchOnlineSpeechData(index: chunkIdx, text: text, voice: voiceMode)
+            let audioData = await resolveOnlineSpeechData(index: chunkIdx, text: text, voice: voiceMode)
             guard self.playSessionToken == sessionToken, self.isSpeaking, !self.isPaused else { return }
             self.isBuffering = false
 
@@ -306,7 +305,6 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 self.playMP3Data(audioData, voiceLabel: voiceMode.shortName)
                 self.prefetchUpcomingChunks(after: chunkIdx, voice: voiceMode, sessionToken: sessionToken)
             } else {
-                // Dự phòng cuối cùng khi mất mạng hoàn toàn: Dùng giọng iPhone ngoại tuyến để không bị đứt mạch
                 self.activeVoiceLabel = "Ngoại tuyến"
                 self.speakViaOfflineSynthesizer(text: text)
             }
@@ -322,7 +320,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
             let targetText = chunks[targetIdx]
             let task = Task<Data?, Never> {
-                let data = await self.fetchOnlineSpeechData(index: targetIdx, text: targetText, voice: voice)
+                let data = await Self.synthesizeSpeechData(text: targetText, voice: voice)
                 if !Task.isCancelled, self.playSessionToken == sessionToken, let data {
                     self.prefetchedAudioCache[targetIdx] = data
                 }
@@ -333,25 +331,28 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         }
     }
 
-    private func fetchOnlineSpeechData(index: Int, text: String, voice: StoryVoiceChoice) async -> Data? {
+    private func resolveOnlineSpeechData(index: Int, text: String, voice: StoryVoiceChoice) async -> Data? {
+        if let cached = prefetchedAudioCache[index] {
+            prefetchedAudioCache.removeValue(forKey: index)
+            return cached
+        }
         if let existingTask = prefetchTasks[index] {
             return await existingTask.value
         }
+        return await Self.synthesizeSpeechData(text: text, voice: voice)
+    }
 
-        // 1. Thử Edge Neural AI (Nam Minh / Hoài My)
+    private static func synthesizeSpeechData(text: String, voice: StoryVoiceChoice) async -> Data? {
         if voice == .namMinh || voice == .hoaiMy {
             if let edgeData = await EdgeNeuralTTSClient.synthesize(text: text, voiceName: voice.rawValue),
                edgeData.count > 200 {
                 return edgeData
             }
         }
-
-        // 2. Thử Google TTS (rất ổn định, không cần API key, tự nhiên hơn giọng iPhone mặc định)
         if let googleData = await GoogleTranslateTTSClient.synthesize(text: text),
            googleData.count > 200 {
             return googleData
         }
-
         return nil
     }
 
@@ -370,7 +371,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 return
             }
         } catch {
-            // Fall through to offline synthesizer
+            // Fall through
         }
         speakViaOfflineSynthesizer(text: chunks[currentChunkIndex])
     }
@@ -447,7 +448,6 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             result.append(cleanTitle)
         }
 
-        // Độ dài ~180-220 ký tự giúp phát rất nhanh (chỉ ~0.4s tải/đoạn) và tương thích tốt với cả Edge Neural lẫn Google TTS
         let maxChunkLen = 200
         for line in lines {
             if line.count <= maxChunkLen {
@@ -494,7 +494,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 }
 
-// MARK: - Microsoft Edge Neural TTS WebSocket Client (Giọng AI tiếng Việt tự nhiên: Nam Minh / Hoài My)
+// MARK: - Microsoft Edge Neural TTS WebSocket Client
 private enum EdgeNeuralTTSClient {
     private static let trustedToken = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
     private static let secMsGecVersion = "1-130.0.2849.68"
@@ -552,7 +552,7 @@ private enum EdgeNeuralTTSClient {
                     }
                 case .data(let data):
                     if data.count >= 2 {
-                        let headerLen = Int(data[0]) << 8 | Int(data[1])
+                        let headerLen = (Int(data[0]) << 8) | Int(data[1])
                         let payloadStart = 2 + headerLen
                         if payloadStart < data.count {
                             let headerData = data.subdata(in: 2..<payloadStart)
@@ -582,7 +582,7 @@ private enum EdgeNeuralTTSClient {
     }
 }
 
-// MARK: - Google Translate TTS Fallback (MP3 tiếng Việt mượt, không cần API key)
+// MARK: - Google Translate TTS Fallback
 private enum GoogleTranslateTTSClient {
     static func synthesize(text: String) async -> Data? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
