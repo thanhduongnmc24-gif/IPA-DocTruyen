@@ -41,8 +41,8 @@ targets:
         CFBundleInfoDictionaryVersion: "6.0"
         CFBundleName: "$(PRODUCT_NAME)"
         CFBundlePackageType: "$(PRODUCT_BUNDLE_PACKAGE_TYPE)"
-        CFBundleShortVersionString: "2.3.0"
-        CFBundleVersion: "5"
+        CFBundleShortVersionString: "2.2.1"
+        CFBundleVersion: "4"
         GoogleDriveAPIKey: "__GOOGLE_DRIVE_API_KEY__"
         GoogleDriveFolderID: "__GOOGLE_DRIVE_FOLDER_ID__"
         LSRequiresIPhoneOS: true
@@ -53,6 +53,8 @@ targets:
           UIColorName: ""
           UIImageName: ""
         UIRequiresFullScreen: true
+        UIBackgroundModes:
+          - audio
         UIStatusBarHidden: false
         UIViewControllerBasedStatusBarAppearance: true
         UISupportedInterfaceOrientations:
