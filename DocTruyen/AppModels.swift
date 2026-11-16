@@ -13,20 +13,17 @@ struct DriveItem: Identifiable, Codable, Equatable, Hashable {
     }
 
     var isTextFile: Bool {
-        let lowerName = name.lowercased()
+        let lowerName = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let lowerMime = mimeType.lowercased()
         if lowerName.hasSuffix(".txt") {
             return true
         }
-        // Chỉ coi là file chữ nếu mimeType là text/plain VÀ không có đuôi file ảnh/khác
         if lowerMime == "text/plain" && !lowerName.contains(".") {
             return true
         }
         return false
     }
 
-    /// Trong mỗi thư mục truyện chỉ có các file chương (.txt) và 1 file ảnh đại diện với tên và đuôi bất kỳ:
-    /// Bất kỳ file nào không phải thư mục và không phải file .txt đều được nhận diện làm ảnh bìa của truyện.
     var isImageFile: Bool {
         !isFolder && !isTextFile
     }
@@ -36,10 +33,11 @@ struct DriveItem: Identifiable, Codable, Equatable, Hashable {
            !customTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return customTitle
         }
-        if name.lowercased().hasSuffix(".txt") {
-            return String(name.dropLast(4))
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.lowercased().hasSuffix(".txt") {
+            return String(trimmed.dropLast(4))
         }
-        return name
+        return trimmed
     }
 }
 

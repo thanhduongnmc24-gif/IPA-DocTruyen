@@ -73,7 +73,7 @@ final class DriveService {
         "https://www.googleapis.com/drive/v3/files/\(fileId)?alt=media&key=\(apiKey)"
     }
 
-    // MARK: - Tải danh sách Thư mục & Chương truyện
+    // MARK: - Tải danh sách Thư mục & Chương truyện (Hỗ trợ đầy đủ 4.000+ chương, retry từng trang)
     func listChildren(
         folderId: String,
         apiKey: String,
@@ -91,27 +91,23 @@ final class DriveService {
 
         var lastDriveError: Error?
         if !trimmedKey.isEmpty {
-            for attempt in 1...3 {
-                do {
-                    return try await listChildrenViaDriveAPI(
-                        folderId: trimmedFolder,
-                        apiKey: trimmedKey,
-                        extraQuery: extraQuery,
-                        pageSize: pageSize
-                    )
-                } catch {
-                    lastDriveError = error
-                    if attempt < 3 {
-                        try? await Task.sleep(nanoseconds: UInt64(attempt) * 700_000_000)
-                    }
-                }
+            do {
+                let items = try await listChildrenViaDriveAPI(
+                    folderId: trimmedFolder,
+                    apiKey: trimmedKey,
+                    extraQuery: extraQuery,
+                    pageSize: pageSize
+                )
+                return sortItemsNaturally(items)
+            } catch {
+                lastDriveError = error
             }
         }
 
         if !cleanScriptUrl.isEmpty && extraQuery.isEmpty {
             if let viaScript = try? await listChildrenViaAppsScript(folderId: trimmedFolder, scriptUrlStr: cleanScriptUrl),
                !viaScript.isEmpty {
-                return viaScript
+                return sortItemsNaturally(viaScript)
             }
         }
 
@@ -121,6 +117,16 @@ final class DriveService {
         throw DriveServiceError.missingCredentials
     }
 
+    /// Sắp xếp tự nhiên theo số (0001, 0002, ..., 1000, ..., 4000) ngay trên máy để không bị lỗi phân trang `orderBy=name_natural` của Google Drive
+    private func sortItemsNaturally(_ items: [DriveItem]) -> [DriveItem] {
+        items.sorted { lhs, rhs in
+            if lhs.isFolder != rhs.isFolder {
+                return lhs.isFolder && !rhs.isFolder
+            }
+            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+        }
+    }
+
     private func listChildrenViaDriveAPI(
         folderId: String,
         apiKey: String,
@@ -128,18 +134,25 @@ final class DriveService {
         pageSize: Int = 1000
     ) async throws -> [DriveItem] {
         var allFiles: [DriveItem] = []
+        var seenIds: Set<String> = []
         var pageToken = ""
+        let includeThumb = !extraQuery.isEmpty
 
         repeat {
             let baseQuery = "'\(folderId)' in parents and trashed=false"
             let finalQuery = extraQuery.isEmpty ? baseQuery : "\(baseQuery) and (\(extraQuery))"
 
             var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
+            let fieldsValue = includeThumb
+                ? "nextPageToken,files(id,name,mimeType,modifiedTime,thumbnailLink)"
+                : "nextPageToken,files(id,name,mimeType,modifiedTime)"
+
             var queryItems: [URLQueryItem] = [
                 URLQueryItem(name: "q", value: finalQuery),
-                URLQueryItem(name: "fields", value: "nextPageToken,files(id,name,mimeType,modifiedTime,thumbnailLink)"),
-                URLQueryItem(name: "orderBy", value: "name_natural"),
+                URLQueryItem(name: "fields", value: fieldsValue),
                 URLQueryItem(name: "pageSize", value: "\(min(max(pageSize, 1), 1000))"),
+                URLQueryItem(name: "supportsAllDrives", value: "true"),
+                URLQueryItem(name: "includeItemsFromAllDrives", value: "true"),
                 URLQueryItem(name: "key", value: apiKey)
             ]
 
@@ -152,17 +165,49 @@ final class DriveService {
                 throw DriveServiceError.apiError("URL Google Drive không hợp lệ.")
             }
 
-            let (data, response) = try await session.data(from: url)
-            let httpResponse = response as? HTTPURLResponse
-            let decoded = try? JSONDecoder().decode(DriveListResponse.self, from: data)
+            // Retry tối đa 3 lần cho RIÊNG từng trang để không bị mất dữ liệu các trang trước nếu trang sau nghẽn mạng
+            var pageDecoded: DriveListResponse?
+            var pageError: Error?
 
-            if let statusCode = httpResponse?.statusCode, !(200...299).contains(statusCode) {
-                let msg = decoded?.error?.message ?? "Không tải được danh sách chương từ Google Drive (HTTP \(statusCode))."
-                throw DriveServiceError.apiError(msg)
+            for attempt in 1...3 {
+                do {
+                    var req = URLRequest(url: url)
+                    req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+                    let (data, response) = try await session.data(for: req)
+                    let httpResponse = response as? HTTPURLResponse
+                    let decoded = try? JSONDecoder().decode(DriveListResponse.self, from: data)
+
+                    if let statusCode = httpResponse?.statusCode, !(200...299).contains(statusCode) {
+                        let msg = decoded?.error?.message ?? "Không tải được danh sách chương từ Google Drive (HTTP \(statusCode))."
+                        throw DriveServiceError.apiError(msg)
+                    }
+
+                    pageDecoded = decoded
+                    pageError = nil
+                    break
+                } catch {
+                    pageError = error
+                    if attempt < 3 {
+                        try? await Task.sleep(nanoseconds: UInt64(attempt) * 700_000_000)
+                    }
+                }
             }
 
-            allFiles.append(contentsOf: decoded?.files ?? [])
-            pageToken = (pageSize < 1000) ? "" : (decoded?.nextPageToken ?? "")
+            if let pageError {
+                throw pageError
+            }
+
+            for item in pageDecoded?.files ?? [] {
+                if seenIds.insert(item.id).inserted {
+                    allFiles.append(item)
+                }
+            }
+
+            let nextToken = pageDecoded?.nextPageToken ?? ""
+            if nextToken == pageToken {
+                break
+            }
+            pageToken = (pageSize < 1000) ? "" : nextToken
         } while !pageToken.isEmpty
 
         return allFiles
@@ -188,8 +233,6 @@ final class DriveService {
     }
 
     // MARK: - Tìm và tải file ảnh đại diện (tên bất kỳ, đuôi bất kỳ) trong mỗi thư mục truyện
-    /// Trong thư mục mỗi truyện gồm các file .txt và 1 file ảnh với tên & đuôi bất kỳ:
-    /// Tìm ngay file không phải thư mục và không phải .txt, tải về và lưu vào bộ nhớ đệm trên máy.
     func fetchAndCacheFolderCover(
         folderId: String,
         apiKey: String,
@@ -199,8 +242,6 @@ final class DriveService {
             return "local://cover/\(folderId)"
         }
 
-        // Tìm mọi file trong thư mục truyện mà KHÔNG phải là folder và KHÔNG có đuôi .txt
-        // (Không giới hạn mimeType contains 'image/' để bắt được mọi tên và mọi đuôi ảnh bất kỳ)
         var candidateFile: DriveItem?
 
         if let nonTxtFiles = try? await listChildren(
@@ -213,7 +254,6 @@ final class DriveService {
             candidateFile = nonTxtFiles.first(where: { !$0.isFolder && !$0.isTextFile })
         }
 
-        // Dự phòng: Nếu câu truy vấn lọc nâng cao không trả về, kiểm tra theo mimeType image/
         if candidateFile == nil {
             if let imageFiles = try? await listChildren(
                 folderId: folderId,
@@ -237,7 +277,6 @@ final class DriveService {
         return coverFile.thumbnailLink ?? "https://drive.google.com/thumbnail?id=\(coverFile.id)&sz=w600"
     }
 
-    /// Tải dữ liệu ảnh từ nhiều nguồn dự phòng của Google Drive (hỗ trợ mọi định dạng ảnh) và lưu vào ổ đĩa
     @discardableResult
     func downloadAndCacheCoverFile(
         _ file: DriveItem,
@@ -251,22 +290,18 @@ final class DriveService {
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         var candidateURLStrings: [String] = []
 
-        // 1. Nếu Google Drive trả sẵn thumbnailLink -> Nâng độ phân giải lên =s600
         if let thumb = file.thumbnailLink, !thumb.isEmpty {
             let highResThumb = thumb.replacingOccurrences(of: "=s220", with: "=s600")
             candidateURLStrings.append(highResThumb)
         }
 
-        // 2. Cổng thumbnail chính thức của Google Drive (tự động giải mã mọi đuôi ảnh bất kỳ sang JPEG/PNG)
         candidateURLStrings.append("https://drive.google.com/thumbnail?id=\(file.id)&sz=w600")
         candidateURLStrings.append("https://lh3.googleusercontent.com/d/\(file.id)=w600")
 
-        // 3. Tải file gốc qua API Key
         if !trimmedKey.isEmpty {
             candidateURLStrings.append(fileMediaURLString(fileId: file.id, apiKey: trimmedKey))
         }
 
-        // 4. Cổng uc?export=download
         candidateURLStrings.append("https://drive.google.com/uc?export=download&id=\(file.id)&confirm=t")
 
         for urlStr in candidateURLStrings {
@@ -383,24 +418,6 @@ final class DriveService {
                     return content
                 }
             }
-        }
-
-        guard let scriptUrl = URL(string: scriptUrlStr) else { return nil }
-        var request = URLRequest(url: scriptUrl)
-        request.httpMethod = "POST"
-        request.setValue("text/plain;charset=utf-8", forHTTPHeaderField: "Content-Type")
-        let payload: [String: Any] = [
-            "action": "read",
-            "fileId": fileId
-        ]
-        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
-        if let (data, resp) = try? await scriptSession.data(for: request),
-           let http = resp as? HTTPURLResponse,
-           (200...299).contains(http.statusCode),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let ok = json["ok"] as? Bool, ok == true,
-           let content = json["content"] as? String {
-            return content
         }
         return nil
     }
