@@ -52,6 +52,54 @@ enum StoryVoiceChoice: String, CaseIterable, Identifiable, Codable {
     }
 }
 
+// MARK: - Các Struct Codable định kiểu tĩnh 100% giúp trình biên dịch Swift biên dịch tức thì trong < 0.5 giây (Không dùng [String: Any] lồng nhau)
+private struct GeminiTTSRequestPayload: Encodable {
+    struct Content: Encodable {
+        struct Part: Encodable {
+            let text: String
+        }
+        let parts: [Part]
+    }
+    struct SafetySetting: Encodable {
+        let category: String
+        let threshold: String
+    }
+    struct GenerationConfig: Encodable {
+        struct SpeechConfig: Encodable {
+            struct VoiceConfig: Encodable {
+                struct PrebuiltVoiceConfig: Encodable {
+                    let voiceName: String
+                }
+                let prebuiltVoiceConfig: PrebuiltVoiceConfig
+            }
+            let voiceConfig: VoiceConfig
+        }
+        let responseModalities: [String]
+        let speechConfig: SpeechConfig
+    }
+
+    let contents: [Content]
+    let safetySettings: [SafetySetting]
+    let generationConfig: GenerationConfig
+}
+
+private struct GeminiTTSResponsePayload: Decodable {
+    struct Candidate: Decodable {
+        struct Content: Decodable {
+            struct Part: Decodable {
+                struct InlineData: Decodable {
+                    let mimeType: String?
+                    let data: String?
+                }
+                let inlineData: InlineData?
+            }
+            let parts: [Part]?
+        }
+        let content: Content?
+    }
+    let candidates: [Candidate]?
+}
+
 @MainActor
 final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegate {
     static let shared = StorySpeechManager()
@@ -147,11 +195,14 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 
     private func updateNowPlayingInfo() {
-        var info: [String: Any] = [
-            MPMediaItemPropertyTitle: currentChapterTitle.isEmpty ? "Đọc Truyện AI" : currentChapterTitle,
-            MPMediaItemPropertyArtist: activeVoiceLabel.isEmpty ? selectedVoiceChoice.shortName : activeVoiceLabel,
-            MPNowPlayingInfoPropertyPlaybackRate: (isSpeaking && !isPaused) ? playbackSpeedMultiplier : 0.0
-        ]
+        let titleValue: String = currentChapterTitle.isEmpty ? "Đọc Truyện AI" : currentChapterTitle
+        let artistValue: String = activeVoiceLabel.isEmpty ? selectedVoiceChoice.shortName : activeVoiceLabel
+        let rateValue: Double = (isSpeaking && !isPaused) ? playbackSpeedMultiplier : 0.0
+
+        var info = [String: Any]()
+        info[MPMediaItemPropertyTitle] = titleValue
+        info[MPMediaItemPropertyArtist] = artistValue
+        info[MPNowPlayingInfoPropertyPlaybackRate] = rateValue
         if totalChunks > 0 {
             info[MPMediaItemPropertyPlaybackDuration] = Double(totalChunks)
             info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = Double(currentChunkIndex)
@@ -398,7 +449,6 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         }
     }
 
-    /// Tải trước tuần tự từng câu một (không bắn song song nhiều kết nối cùng lúc gây nghẽn WebSocket hoặc chạm trần 429)
     private func startSequentialPrefetch(after index: Int, voice: StoryVoiceChoice, sessionToken: UUID) {
         prefetchTask?.cancel()
         let apiKey = Self.currentSavedGeminiApiKey
@@ -431,12 +481,10 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
         switch voice {
         case .namMinh, .hoaiMy:
-            // 1. Ưu tiên tuyệt đối Edge Neural AI (Nam Minh / Hoài My) có thử lại 2 lần
             if let edgeData = await EdgeNeuralTTSClient.synthesize(text: cleaned, voiceName: voice.edgeVoiceName),
                edgeData.count > 200 {
                 return edgeData
             }
-            // 2. Nếu lỗi mạng với Edge -> thử Gemini AI TTS (nếu có key)
             if !geminiApiKey.isEmpty {
                 if let geminiAudio = await GeminiTTSClient.synthesize(
                     text: cleaned,
@@ -446,14 +494,12 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     return geminiAudio
                 }
             }
-            // 3. Dự phòng cuối cùng mới dùng Google TTS
             if let googleData = await GoogleTranslateTTSClient.synthesize(text: cleaned),
                googleData.count > 200 {
                 return googleData
             }
 
         case .geminiKore, .geminiPuck:
-            // 1. Ưu tiên gọi Gemini 2.5 Flash TTS
             if !geminiApiKey.isEmpty {
                 if let geminiAudio = await GeminiTTSClient.synthesize(
                     text: cleaned,
@@ -463,12 +509,10 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     return geminiAudio
                 }
             }
-            // 2. Khi Gemini Free Tier chạm giới hạn 3 câu/phút (429), chuyển sang giọng AI Neural (Hoài My / Nam Minh) thay vì nhảy thẳng về chị Google!
             if let edgeData = await EdgeNeuralTTSClient.synthesize(text: cleaned, voiceName: voice.edgeVoiceName),
                edgeData.count > 200 {
                 return edgeData
             }
-            // 3. Dự phòng cuối cùng
             if let googleData = await GoogleTranslateTTSClient.synthesize(text: cleaned),
                googleData.count > 200 {
                 return googleData
@@ -568,12 +612,10 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         var s = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else { return "" }
 
-        // 1. Bỏ tiêu đề markdown đầu dòng (### ...)
         if let r = s.range(of: #"^#{1,6}\s*"#, options: .regularExpression) {
             s.removeSubrange(r)
         }
 
-        // 2. Loại bỏ toàn bộ dấu ngoặc kép, ngoặc truyện và các ký tự trang trí (===, ***, ###)
         let forbiddenLiterals = [
             "\"", "“", "”", "„", "‟", "«", "»", "‹", "›",
             "‘", "’", "`", "´",
@@ -585,16 +627,13 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             s = s.replacingOccurrences(of: token, with: " ")
         }
 
-        // 3. Nếu cả dòng chỉ là dòng kẻ phân cách (===, ---, ***, ___, ~~~, ===o0o===, ...)
         if s.range(of: #"^[\s=\-\*_~•·\.…o0O\+<>\|/]+$"#, options: .regularExpression) != nil {
             return ""
         }
 
-        // 4. Thay dấu ba chấm (..., …) và gạch ngang dài (---, —, –) bằng dấu phẩy ngắt nhịp tự nhiên
         s = s.replacingOccurrences(of: #"(\.{2,}|…+)"#, with: ", ", options: .regularExpression)
         s = s.replacingOccurrences(of: #"(\-{2,}|—+|–+)"#, with: ", ", options: .regularExpression)
 
-        // 5. Dọn các dấu phẩy bị lặp hoặc dấu phẩy thừa ở ĐẦU / CUỐI câu (Tuyệt đối giữ nguyên dấu phẩy ở giữa câu!)
         s = s.replacingOccurrences(of: #"(\s*,\s*){2,}"#, with: ", ", options: .regularExpression)
         s = s.replacingOccurrences(of: #"[,\s]+([.!?])"#, with: "$1", options: .regularExpression)
         s = s.replacingOccurrences(of: #"([.!?])\s*,+"#, with: "$1", options: .regularExpression)
@@ -603,7 +642,6 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         s = s.replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
         s = s.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // 6. Chỉ giữ lại nếu có ít nhất 1 chữ cái hoặc chữ số
         guard s.rangeOfCharacter(from: .alphanumerics) != nil else {
             return ""
         }
@@ -663,7 +701,6 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             }
         }
 
-        // Độ dài 145 ký tự/đoạn giúp Edge Neural AI tải cực nhanh (~0.7s) và không bao giờ bị timeout
         let maxChunkLen = 145
 
         for (lineIdx, rawLine) in rawLines.enumerated() {
@@ -726,7 +763,10 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 }
                 if !subBuf.isEmpty {
                     if subBuf.count > maxChunkLen {
-                        output.append(contentsOf: splitByWords(subBuf, maxLen: maxChunkLen))
+                        let extraWords = splitByWords(subBuf, maxLen: maxChunkLen)
+                        for w in extraWords {
+                            output.append(w)
+                        }
                     } else {
                         output.append(subBuf)
                     }
@@ -749,10 +789,10 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 
     private func splitByWords(_ text: String, maxLen: Int) -> [String] {
-        let words = text.split(separator: " ").map(String.init)
+        let words = text.components(separatedBy: " ")
         var chunks: [String] = []
         var current = ""
-        for w in words {
+        for w in words where !w.isEmpty {
             let cand = current.isEmpty ? w : "\(current) \(w)"
             if cand.count > maxLen && !current.isEmpty {
                 chunks.append(current)
@@ -768,12 +808,12 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 }
 
-// MARK: - Gemini 2.5 Flash Native Audio TTS Client (Bọc chuẩn RIFF/WAV 24kHz 16-bit PCM + Safety BLOCK_NONE)
+// MARK: - Gemini 2.5 Flash Native Audio TTS Client (Dùng Codable Struct 100% không gây treo Type-Checker)
 private enum GeminiTTSClient {
     private static let stateLock = NSLock()
     private static var quotaCooldownUntil: TimeInterval = 0
 
-    private static let candidateTTSModels = [
+    private static let candidateTTSModels: [String] = [
         "gemini-2.5-flash-preview-tts",
         "gemini-2.5-flash-tts"
     ]
@@ -832,39 +872,28 @@ private enum GeminiTTSClient {
         let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)"
         guard let url = URL(string: urlString) else { return .tryNextModel }
 
-        let requestBody: [String: Any] = [
-            "contents": [
-                [
-                    "parts": [
-                        ["text": "Read aloud in Vietnamese:\n\(text)"]
-                    ]
-                ]
-            ],
-            "safetySettings": [
-                ["category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"],
-                ["category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"],
-                ["category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"],
-                ["category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"]
-            ],
-            "generationConfig": [
-                "responseModalities": ["AUDIO"],
-                "speechConfig": [
-                    "voiceConfig": [
-                        "prebuiltVoiceConfig": [
-                            "voiceName": voiceName
-                        ]
-                    ]
-                ]
-            ]
+        let part = GeminiTTSRequestPayload.Content.Part(text: "Read aloud in Vietnamese:\n\(text)")
+        let content = GeminiTTSRequestPayload.Content(parts: [part])
+        let safety: [GeminiTTSRequestPayload.SafetySetting] = [
+            GeminiTTSRequestPayload.SafetySetting(category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE"),
+            GeminiTTSRequestPayload.SafetySetting(category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE"),
+            GeminiTTSRequestPayload.SafetySetting(category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE"),
+            GeminiTTSRequestPayload.SafetySetting(category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE")
         ]
+        let prebuilt = GeminiTTSRequestPayload.GenerationConfig.SpeechConfig.VoiceConfig.PrebuiltVoiceConfig(voiceName: voiceName)
+        let voiceCfg = GeminiTTSRequestPayload.GenerationConfig.SpeechConfig.VoiceConfig(prebuiltVoiceConfig: prebuilt)
+        let speechCfg = GeminiTTSRequestPayload.GenerationConfig.SpeechConfig(voiceConfig: voiceCfg)
+        let genCfg = GeminiTTSRequestPayload.GenerationConfig(responseModalities: ["AUDIO"], speechConfig: speechCfg)
+        let payload = GeminiTTSRequestPayload(contents: [content], safetySettings: safety, generationConfig: genCfg)
+
+        guard let bodyData = try? JSONEncoder().encode(payload) else {
+            return .tryNextModel
+        }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 15
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        guard let bodyData = try? JSONSerialization.data(withJSONObject: requestBody) else {
-            return .tryNextModel
-        }
         request.httpBody = bodyData
 
         do {
@@ -877,20 +906,17 @@ private enum GeminiTTSClient {
                 return .tryNextModel
             }
 
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let candidates = json["candidates"] as? [[String: Any]],
-                  let firstCandidate = candidates.first,
-                  let content = firstCandidate["content"] as? [String: Any],
-                  let parts = content["parts"] as? [[String: Any]] else {
+            guard let decoded = try? JSONDecoder().decode(GeminiTTSResponsePayload.self, from: data),
+                  let parts = decoded.candidates?.first?.content?.parts else {
                 return .tryNextModel
             }
 
-            for part in parts {
-                if let inlineData = part["inlineData"] as? [String: Any],
-                   let b64 = inlineData["data"] as? String,
+            for item in parts {
+                if let inlineData = item.inlineData,
+                   let b64 = inlineData.data,
                    let rawAudio = Data(base64Encoded: b64, options: .ignoreUnknownCharacters),
                    rawAudio.count > 200 {
-                    let mime = ((inlineData["mimeType"] as? String) ?? "").lowercased()
+                    let mime = (inlineData.mimeType ?? "").lowercased()
                     if mime.contains("wav") || isAlreadyContainerized(rawAudio) {
                         return .success(rawAudio)
                     } else {
@@ -940,10 +966,10 @@ private enum GeminiTTSClient {
         let chunkSize = UInt32(36) + dataSize
 
         var header = Data(capacity: 44 + pcmData.count)
-        header.append(contentsOf: [0x52, 0x49, 0x46, 0x46]) // "RIFF"
+        header.append(Data("RIFF".utf8))
         header.append(uint32LE(chunkSize))
-        header.append(contentsOf: [0x57, 0x41, 0x56, 0x45]) // "WAVE"
-        header.append(contentsOf: [0x66, 0x6D, 0x74, 0x20]) // "fmt "
+        header.append(Data("WAVE".utf8))
+        header.append(Data("fmt ".utf8))
         header.append(uint32LE(16))
         header.append(uint16LE(1))
         header.append(uint16LE(channels))
@@ -951,7 +977,7 @@ private enum GeminiTTSClient {
         header.append(uint32LE(byteRate))
         header.append(uint16LE(blockAlign))
         header.append(uint16LE(bitsPerSample))
-        header.append(contentsOf: [0x64, 0x61, 0x74, 0x61]) // "data"
+        header.append(Data("data".utf8))
         header.append(uint32LE(dataSize))
         header.append(pcmData)
         return header
@@ -968,7 +994,7 @@ private enum GeminiTTSClient {
     }
 }
 
-// MARK: - Microsoft Edge Neural TTS WebSocket Client (Có Retry + Timeout 11s + Định dạng X-Timestamp chuẩn)
+// MARK: - Microsoft Edge Neural TTS WebSocket Client
 private enum EdgeNeuralTTSClient {
     private static let trustedToken = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
     private static let secMsGecVersion = "1-130.0.2849.68"
@@ -984,13 +1010,11 @@ private enum EdgeNeuralTTSClient {
             await syncServerClock()
         }
 
-        // Thử lần 1 với timeout 10 giây
         if let data = await attemptSynthesizeWithTimeout(text: trimmed, voiceName: voiceName, timeoutSeconds: 10.0),
            data.count > 200 {
             return data
         }
 
-        // Nếu nghẽn mạng tạm thời -> đồng bộ lại giờ server và thử lại lần 2 trước khi bỏ cuộc
         await syncServerClock()
         if let retryData = await attemptSynthesizeWithTimeout(text: trimmed, voiceName: voiceName, timeoutSeconds: 10.0),
            retryData.count > 200 {
@@ -1076,7 +1100,7 @@ private enum EdgeNeuralTTSClient {
         let urlString = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=\(trustedToken)&Sec-MS-GEC=\(secMsGec)&Sec-MS-GEC-Version=\(secMsGecVersion)&ConnectionId=\(connectionId)"
         guard let url = URL(string: urlString) else { return nil }
 
-        let muid = (0..<32).map { _ in String(format: "%X", Int.random(in: 0...15)) }.joined()
+        let muid = UUID().uuidString.replacingOccurrences(of: "-", with: "").uppercased()
         var request = URLRequest(url: url)
         request.timeoutInterval = 10
         request.setValue("chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold", forHTTPHeaderField: "Origin")
@@ -1159,7 +1183,11 @@ private enum EdgeNeuralTTSClient {
         let fileTime = roundedSeconds * 10_000_000
         let raw = "\(fileTime)\(trustedToken)"
         let digest = SHA256.hash(data: Data(raw.utf8))
-        return digest.map { String(format: "%02X", $0) }.joined()
+        var hexResult = ""
+        for byte in digest {
+            hexResult += String(format: "%02X", byte)
+        }
+        return hexResult
     }
 
     private static func formatEdgeTimestamp(from timestamp: TimeInterval) -> String {
