@@ -128,6 +128,9 @@ final class AppViewModel: ObservableObject {
         didSet { UserDefaults.standard.set(autoNextChapterOnScrollEnd, forKey: autoNextOnScrollEndStorageKey) }
     }
     @Published var showSpeechControls: Bool = false
+    @Published var currentReaderScrollRatio: Double = 0.0
+    @Published var didUserScrollWhileSpeechActive: Bool = false
+    var liveScrollRatioProvider: (() -> Double)?
 
     // MARK: - AI Gemini Translation Settings & Batch State
     @Published var geminiApiKey: String = "" {
@@ -302,6 +305,11 @@ final class AppViewModel: ObservableObject {
         StorySpeechManager.shared.onChapterFinished = { [weak self] in
             Task { @MainActor in
                 await self?.handleSpeechChapterFinished()
+            }
+        }
+        StorySpeechManager.shared.onError = { [weak self] message in
+            Task { @MainActor in
+                self?.showToast(message)
             }
         }
         Task {
@@ -790,6 +798,8 @@ final class AppViewModel: ObservableObject {
         selectedChapter = chapter
         tocVisible = false
         nextSwipePromptVisible = false
+        currentReaderScrollRatio = 0.0
+        didUserScrollWhileSpeechActive = false
 
         if let localSaved = LocalChapterStorage.shared.readChapterContent(chapterId: chapter.id),
            !localSaved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -1389,17 +1399,35 @@ final class AppViewModel: ObservableObject {
         autoScrollSpeed = min(160, max(15, autoScrollSpeed + delta))
     }
 
+    func handleReaderScrollChanged(ratio: Double, isUserInteracting: Bool) {
+        let previous = currentReaderScrollRatio
+        currentReaderScrollRatio = ratio
+        if isUserInteracting && StorySpeechManager.shared.isSpeaking && abs(ratio - previous) > 0.008 {
+            didUserScrollWhileSpeechActive = true
+        }
+    }
+
     func toggleSpeechPlayback() {
         let speech = StorySpeechManager.shared
+        let activeRatio = liveScrollRatioProvider?() ?? currentReaderScrollRatio
+        currentReaderScrollRatio = activeRatio
+
         if speech.isSpeaking {
-            speech.togglePlayPause()
-            showSpeechControls = true
+            if didUserScrollWhileSpeechActive {
+                didUserScrollWhileSpeechActive = false
+                speech.jumpToScrollRatio(activeRatio)
+                showSpeechControls = true
+            } else {
+                speech.togglePlayPause()
+                showSpeechControls = true
+            }
         } else {
             isAutoScrolling = false
             showAutoScrollControls = false
             showSpeechControls = true
+            didUserScrollWhileSpeechActive = false
             let title = selectedChapter?.cleanChapterName ?? ""
-            speech.startSpeaking(title: title, text: chapterContent)
+            speech.startSpeaking(title: title, text: chapterContent, fromScrollRatio: activeRatio)
             updateKeepAwakeState()
         }
     }
@@ -1407,6 +1435,7 @@ final class AppViewModel: ObservableObject {
     func stopSpeechPlayback() {
         StorySpeechManager.shared.stop()
         showSpeechControls = false
+        didUserScrollWhileSpeechActive = false
         updateKeepAwakeState()
     }
 
@@ -1420,8 +1449,10 @@ final class AppViewModel: ObservableObject {
         }
         await openChapter(chapters[idx + 1])
         if screenMode == .reader && !chapterContent.isEmpty && !isChapterLoading {
+            currentReaderScrollRatio = 0.0
+            didUserScrollWhileSpeechActive = false
             let title = selectedChapter?.cleanChapterName ?? ""
-            StorySpeechManager.shared.startSpeaking(title: title, text: chapterContent)
+            StorySpeechManager.shared.startSpeaking(title: title, text: chapterContent, fromScrollRatio: 0.0)
             updateKeepAwakeState()
         }
     }

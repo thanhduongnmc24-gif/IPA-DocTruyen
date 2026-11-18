@@ -804,6 +804,12 @@ struct ContentView: View {
                                         viewModel.isAutoScrolling = true
                                     }
                                 }
+                            },
+                            onScrollProgressChanged: { ratio, isUserDragging in
+                                viewModel.handleReaderScrollChanged(ratio: ratio, isUserInteracting: isUserDragging)
+                            },
+                            onRegisterScrollRatioProvider: { provider in
+                                viewModel.liveScrollRatioProvider = provider
                             }
                         )
                         .frame(width: 0, height: 0)
