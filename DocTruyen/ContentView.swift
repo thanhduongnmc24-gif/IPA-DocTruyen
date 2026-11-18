@@ -666,10 +666,31 @@ struct ContentView: View {
     }
 
     // MARK: - Chapters List View
+    private var activeChapterIdForCurrentList: String? {
+        if let selId = viewModel.selectedChapter?.id,
+           viewModel.chapters.contains(where: { $0.id == selId }) {
+            return selId
+        }
+        return viewModel.currentStorySavedState?.chapterId
+    }
+
+    private func scrollChapterListToActive(_ proxy: ScrollViewProxy) {
+        guard viewModel.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let targetId = activeChapterIdForCurrentList else {
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+            proxy.scrollTo(targetId, anchor: .center)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            proxy.scrollTo(targetId, anchor: .center)
+        }
+    }
+
     @ViewBuilder
     private func chaptersContentView(palette: ThemePalette) -> some View {
         let _ = viewModel.translatedRevisionTrigger
-        let savedChapterId = viewModel.currentStorySavedState?.chapterId
+        let savedChapterId = activeChapterIdForCurrentList
 
         ScrollViewReader { proxy in
             ScrollView {
@@ -684,13 +705,10 @@ struct ContentView: View {
                 await viewModel.refreshCurrentFolder()
             }
             .onAppear {
-                if let targetId = viewModel.selectedChapter?.id ?? savedChapterId {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                        withAnimation {
-                            proxy.scrollTo(targetId, anchor: .center)
-                        }
-                    }
-                }
+                scrollChapterListToActive(proxy)
+            }
+            .onChange(of: viewModel.chapters.count) { _ in
+                scrollChapterListToActive(proxy)
             }
         }
     }

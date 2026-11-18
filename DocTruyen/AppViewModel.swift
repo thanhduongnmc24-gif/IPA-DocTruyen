@@ -713,6 +713,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func openFolder(_ item: DriveItem) async {
+        selectedChapter = nil
         let node = FolderNode(id: item.id, name: item.name)
         folderStack.append(node)
         _ = await loadFolder(node)

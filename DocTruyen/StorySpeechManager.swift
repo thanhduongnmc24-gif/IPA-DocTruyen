@@ -52,7 +52,7 @@ enum StoryVoiceChoice: String, CaseIterable, Identifiable, Codable {
     }
 }
 
-// MARK: - Codable Struct chuẩn cho Gemini TTS (Không chứa safetySettings hay systemInstruction để tránh lỗi HTTP 400 trên endpoint TTS)
+// MARK: - Codable Struct chuẩn cho Gemini TTS
 private struct GeminiTTSRequestPayload: Encodable {
     struct Content: Encodable {
         struct Part: Encodable {
@@ -111,7 +111,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         didSet {
             UserDefaults.standard.set(selectedVoiceChoice.rawValue, forKey: "DOC_TRUYEN_SPEECH_VOICE_CHOICE")
             if isSpeaking {
-                prefetchedAudioCache.removeAll()
+                cancelAllPrefetchAndCache()
                 restartFromCurrentChunk()
             }
         }
@@ -135,8 +135,12 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     private var chunks: [String] = []
     private var chunkStartRatios: [Double] = []
     private var hasPrependedTitleChunk: Bool = false
+
+    /// Bộ nhớ đệm âm thanh đã tải sẵn trong RAM (tải trước tối đa 5 đoạn tiếp theo)
     private var prefetchedAudioCache: [Int: Data] = [:]
-    private var prefetchTask: Task<Void, Never>?
+    /// Danh sách các Task đang tải dở của từng đoạn — tái sử dụng kết quả đang tải, tuyệt đối không hủy hoặc tải trùng
+    private var inFlightTasks: [Int: Task<Data?, Never>] = [:]
+    private var prefetchCoordinatorTask: Task<Void, Never>?
     private var playSessionToken: UUID = UUID()
     private var consecutiveFailures: Int = 0
     private var tempFileToggle: Int = 0
@@ -203,6 +207,16 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = Double(currentChunkIndex)
         }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    private func cancelAllPrefetchAndCache() {
+        prefetchCoordinatorTask?.cancel()
+        prefetchCoordinatorTask = nil
+        for (_, task) in inFlightTasks {
+            task.cancel()
+        }
+        inFlightTasks.removeAll()
+        prefetchedAudioCache.removeAll()
     }
 
     func startSpeaking(title: String, text: String, fromScrollRatio: Double = 0.0) {
@@ -297,8 +311,8 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         guard isSpeaking, !chunks.isEmpty else { return }
         audioPlayer?.stop()
         audioPlayer = nil
-        prefetchTask?.cancel()
-        prefetchTask = nil
+        prefetchCoordinatorTask?.cancel()
+        prefetchCoordinatorTask = nil
         playSessionToken = UUID()
         isPaused = false
         playCurrentChunk()
@@ -366,9 +380,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         playSessionToken = UUID()
         audioPlayer?.stop()
         audioPlayer = nil
-        prefetchTask?.cancel()
-        prefetchTask = nil
-        prefetchedAudioCache.removeAll()
+        cancelAllPrefetchAndCache()
 
         isSpeaking = false
         isPaused = false
@@ -391,7 +403,78 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // MARK: - Phát từng đoạn & tải trước tuần tự
+    // MARK: - Cơ chế Tải trước Đa luồng Thông minh (Không bao giờ tải lại câu đang tải & Luôn nạp sẵn 4 đoạn tiếp theo trong RAM)
+    private func getOrCreateSynthesisTask(
+        for index: Int,
+        voice: StoryVoiceChoice
+    ) -> Task<Data?, Never>? {
+        guard index >= 0, index < chunks.count else { return nil }
+        if let existingTask = inFlightTasks[index] {
+            return existingTask
+        }
+        let targetText = chunks[index]
+        let apiKey = Self.currentSavedGeminiApiKey
+
+        let task = Task<Data?, Never> { [weak self] in
+            let data = await Self.synthesizeSpeechData(text: targetText, voice: voice, geminiApiKey: apiKey)
+            if !Task.isCancelled, let self {
+                if let data {
+                    self.prefetchedAudioCache[index] = data
+                }
+                self.inFlightTasks.removeValue(forKey: index)
+            }
+            return data
+        }
+        inFlightTasks[index] = task
+        return task
+    }
+
+    private func resolveAudioData(for index: Int, voice: StoryVoiceChoice) async -> Data? {
+        if let cached = prefetchedAudioCache[index] {
+            prefetchedAudioCache.removeValue(forKey: index)
+            return cached
+        }
+        if let task = getOrCreateSynthesisTask(for: index, voice: voice) {
+            let data = await task.value
+            prefetchedAudioCache.removeValue(forKey: index)
+            return data
+        }
+        return nil
+    }
+
+    /// Ngay khi bắt đầu phát hoặc tải đoạn `index`, tự động nạp trước 4 đoạn kế tiếp (`index + 1 ... index + 4`) vào RAM
+    private func scheduleLookaheadPrefetch(from index: Int, voice: StoryVoiceChoice, sessionToken: UUID) {
+        prefetchCoordinatorTask?.cancel()
+        let lookaheadCount = (voice == .geminiKore || voice == .geminiPuck) ? 2 : 4
+
+        // Khởi động ngay đoạn kế tiếp (index + 1) để song hành cùng đoạn hiện tại, giúp đoạn 2 không bao giờ phải chờ đoạn 1 đọc xong mới tải
+        let nextImmediate = index + 1
+        if nextImmediate < chunks.count && prefetchedAudioCache[nextImmediate] == nil && inFlightTasks[nextImmediate] == nil {
+            _ = getOrCreateSynthesisTask(for: nextImmediate, voice: voice)
+        }
+
+        prefetchCoordinatorTask = Task { [weak self] in
+            guard let self else { return }
+            for offset in 1...lookaheadCount {
+                if Task.isCancelled || self.playSessionToken != sessionToken { return }
+                let targetIdx = index + offset
+                guard targetIdx < self.chunks.count else { break }
+
+                if self.prefetchedAudioCache[targetIdx] != nil {
+                    continue
+                }
+                if let task = self.getOrCreateSynthesisTask(for: targetIdx, voice: voice) {
+                    _ = await task.value
+                }
+            }
+            // Dọn các đoạn cũ đã đọc qua khỏi RAM để tiết kiệm bộ nhớ
+            let minKeep = max(0, index - 1)
+            for key in self.prefetchedAudioCache.keys where key < minKeep {
+                self.prefetchedAudioCache.removeValue(forKey: key)
+            }
+        }
+    }
+
     private func playCurrentChunk() {
         let sessionToken = playSessionToken
         guard currentChunkIndex >= 0, currentChunkIndex < chunks.count else {
@@ -403,34 +486,31 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
         let voiceMode = selectedVoiceChoice
         let chunkIdx = currentChunkIndex
-        let text = chunks[chunkIdx]
 
+        // Nếu đoạn này đã được tải trước nằm sẵn trong RAM -> Phát tức thì trong 0.001 giây (không cần chờ mạng, không hiện vòng xoay!)
         if let cachedData = prefetchedAudioCache[chunkIdx] {
             prefetchedAudioCache.removeValue(forKey: chunkIdx)
+            isBuffering = false
             if playAudioData(cachedData, voiceLabel: voiceMode.shortName) {
                 consecutiveFailures = 0
-                startSequentialPrefetch(after: chunkIdx, voice: voiceMode, sessionToken: sessionToken)
+                scheduleLookaheadPrefetch(from: chunkIdx, voice: voiceMode, sessionToken: sessionToken)
                 return
             }
         }
 
+        // Bắt đầu tải đoạn hiện tại VÀ kích hoạt tải trước đoạn kế tiếp (chunkIdx + 1) ngay lập tức
         isBuffering = true
-        let apiKey = Self.currentSavedGeminiApiKey
-        Task {
-            let audioData: Data?
-            if let cached = self.prefetchedAudioCache[chunkIdx] {
-                self.prefetchedAudioCache.removeValue(forKey: chunkIdx)
-                audioData = cached
-            } else {
-                audioData = await Self.synthesizeSpeechData(text: text, voice: voiceMode, geminiApiKey: apiKey)
-            }
+        _ = getOrCreateSynthesisTask(for: chunkIdx, voice: voiceMode)
+        scheduleLookaheadPrefetch(from: chunkIdx, voice: voiceMode, sessionToken: sessionToken)
 
+        Task {
+            let audioData = await self.resolveAudioData(for: chunkIdx, voice: voiceMode)
             guard self.playSessionToken == sessionToken, self.isSpeaking, !self.isPaused else { return }
             self.isBuffering = false
 
             if let audioData, self.playAudioData(audioData, voiceLabel: voiceMode.shortName) {
                 self.consecutiveFailures = 0
-                self.startSequentialPrefetch(after: chunkIdx, voice: voiceMode, sessionToken: sessionToken)
+                self.scheduleLookaheadPrefetch(from: chunkIdx, voice: voiceMode, sessionToken: sessionToken)
             } else {
                 self.consecutiveFailures += 1
                 if self.consecutiveFailures < 3 && self.currentChunkIndex + 1 < self.chunks.count {
@@ -439,28 +519,6 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 } else {
                     self.stopInternal(resetTitle: false)
                     self.onError?("Không thể tải âm thanh giọng đọc AI. Vui lòng kiểm tra kết nối mạng.")
-                }
-            }
-        }
-    }
-
-    private func startSequentialPrefetch(after index: Int, voice: StoryVoiceChoice, sessionToken: UUID) {
-        prefetchTask?.cancel()
-        let apiKey = Self.currentSavedGeminiApiKey
-        let maxLookahead = (voice == .geminiKore || voice == .geminiPuck) ? 1 : 2
-
-        prefetchTask = Task {
-            for offset in 1...maxLookahead {
-                if Task.isCancelled || self.playSessionToken != sessionToken { return }
-                let targetIdx = index + offset
-                guard targetIdx < self.chunks.count else { break }
-                if self.prefetchedAudioCache[targetIdx] != nil { continue }
-
-                let targetText = self.chunks[targetIdx]
-                let data = await Self.synthesizeSpeechData(text: targetText, voice: voice, geminiApiKey: apiKey)
-                if Task.isCancelled || self.playSessionToken != sessionToken { return }
-                if let data {
-                    self.prefetchedAudioCache[targetIdx] = data
                 }
             }
         }
@@ -476,12 +534,10 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
         switch voice {
         case .namMinh, .hoaiMy:
-            // 1. Ưu tiên tuyệt đối Edge Neural AI v2 (Sec-MS-GEC v2 2-143.0.3650.75)
             if let edgeData = await EdgeNeuralTTSClient.synthesize(text: cleaned, voiceName: voice.edgeVoiceName),
                edgeData.count > 200 {
                 return edgeData
             }
-            // 2. Dự phòng sang Gemini TTS (3.1 Flash TTS / 2.5 Flash TTS)
             if !geminiApiKey.isEmpty {
                 if let geminiAudio = await GeminiTTSClient.synthesize(
                     text: cleaned,
@@ -491,14 +547,12 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     return geminiAudio
                 }
             }
-            // 3. Dự phòng cuối cùng
             if let googleData = await GoogleTranslateTTSClient.synthesize(text: cleaned),
                googleData.count > 200 {
                 return googleData
             }
 
         case .geminiKore, .geminiPuck:
-            // 1. Ưu tiên Gemini TTS (xoay vòng 3 model: gemini-3.1-flash-tts-preview -> gemini-2.5-flash-preview-tts -> gemini-2.5-flash-lite-preview-tts)
             if !geminiApiKey.isEmpty {
                 if let geminiAudio = await GeminiTTSClient.synthesize(
                     text: cleaned,
@@ -508,12 +562,10 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     return geminiAudio
                 }
             }
-            // 2. Dự phòng sang Edge Neural AI v2 cùng giới tính giọng (Hoài My / Nam Minh)
             if let edgeData = await EdgeNeuralTTSClient.synthesize(text: cleaned, voiceName: voice.edgeVoiceName),
                edgeData.count > 200 {
                 return edgeData
             }
-            // 3. Dự phòng cuối cùng
             if let googleData = await GoogleTranslateTTSClient.synthesize(text: cleaned),
                googleData.count > 200 {
                 return googleData
@@ -677,8 +729,8 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
         let totalVisualLines = max(1.0, cumulativeVisualLines)
 
-        var resultChunks: [String] = []
-        var resultRatios: [Double] = []
+        var rawLineChunks: [String] = []
+        var rawLineRatios: [Double] = []
         var hasPrependedTitle = false
 
         let cleanTitle = Self.sanitizeLineForSpeech(title)
@@ -691,18 +743,18 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 let foldedFirst = first.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "vi_VN"))
                 let foldedTitle = cleanTitle.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "vi_VN"))
                 if !foldedFirst.contains(foldedTitle) {
-                    resultChunks.append(cleanTitle)
-                    resultRatios.append(0.0)
+                    rawLineChunks.append(cleanTitle)
+                    rawLineRatios.append(0.0)
                     hasPrependedTitle = true
                 }
             } else {
-                resultChunks.append(cleanTitle)
-                resultRatios.append(0.0)
+                rawLineChunks.append(cleanTitle)
+                rawLineRatios.append(0.0)
                 hasPrependedTitle = true
             }
         }
 
-        let maxChunkLen = 175
+        let singleMaxLen = 280
 
         for (lineIdx, rawLine) in rawLines.enumerated() {
             let linecleaned = Self.sanitizeLineForSpeech(rawLine)
@@ -712,7 +764,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             let lineVisualHeight = max(1.0, ceil(Double(linecleaned.count) / charsPerVisualLine))
             let lineTotalChars = max(1, linecleaned.count)
 
-            let lineSubChunks = splitCleanedLineIntoChunks(linecleaned, maxChunkLen: maxChunkLen)
+            let lineSubChunks = splitCleanedLineIntoChunks(linecleaned, maxChunkLen: singleMaxLen)
             var consumedChars = 0
 
             for sub in lineSubChunks {
@@ -722,13 +774,43 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 let chunkVisualY = lineStartVisual + progressInLine * lineVisualHeight
                 let ratio = min(1.0, max(0.0, chunkVisualY / totalVisualLines))
 
-                resultChunks.append(finalChunk)
-                resultRatios.append(ratio)
+                rawLineChunks.append(finalChunk)
+                rawLineRatios.append(ratio)
                 consumedChars += sub.count
             }
         }
 
-        return (resultChunks, resultRatios, hasPrependedTitle)
+        // Gộp các câu ngắn liên tiếp thành các đoạn ~280 ký tự (~18-22 giây âm thanh/đoạn)
+        // Giúp mỗi đoạn đọc đủ lâu để 4 đoạn tiếp theo luôn tải xong 100% trong nền, chuyển đoạn mượt tuyệt đối không bao giờ phải chờ
+        var mergedChunks: [String] = []
+        var mergedRatios: [Double] = []
+        let targetMergeLen = 280
+
+        var idx = 0
+        while idx < rawLineChunks.count {
+            var currentText = rawLineChunks[idx]
+            let startRatio = rawLineRatios[idx]
+            idx += 1
+
+            while idx < rawLineChunks.count {
+                let nextText = rawLineChunks[idx]
+                let combinedLen = currentText.count + 2 + nextText.count
+                if combinedLen <= targetMergeLen {
+                    if currentText.hasSuffix(".") || currentText.hasSuffix("!") || currentText.hasSuffix("?") {
+                        currentText += " \(nextText)"
+                    } else {
+                        currentText += ". \(nextText)"
+                    }
+                    idx += 1
+                } else {
+                    break
+                }
+            }
+            mergedChunks.append(currentText)
+            mergedRatios.append(startRatio)
+        }
+
+        return (mergedChunks, mergedRatios, hasPrependedTitle)
     }
 
     private func splitCleanedLineIntoChunks(_ line: String, maxChunkLen: Int) -> [String] {
@@ -854,7 +936,6 @@ private enum GeminiTTSClient {
             case .success(let wavData):
                 return wavData
             case .rateLimited:
-                // Chỉ đánh dấu cooldown trên nhánh model bị 429 và thử ngay sang model TTS tiếp theo
                 markModelCooldown(model, seconds: 22)
                 continue
             case .tryNextModel:
@@ -1051,10 +1132,7 @@ private enum EdgeNeuralTTSClient {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
-        if !isClockSynced() {
-            await syncServerClock()
-        }
-
+        // Không chặn chờ syncServerClock ở lần đầu để giảm độ trễ xuống tối thiểu
         if let data = await attemptSynthesizeWithTimeout(text: trimmed, voiceName: voiceName, timeoutSeconds: 10.0),
            data.count > 200 {
             return data
@@ -1067,12 +1145,6 @@ private enum EdgeNeuralTTSClient {
         }
 
         return nil
-    }
-
-    private static func isClockSynced() -> Bool {
-        clockLock.lock()
-        defer { clockLock.unlock() }
-        return hasSyncedServerClock
     }
 
     private static func setServerClockOffset(_ offset: TimeInterval) {
@@ -1302,7 +1374,6 @@ private enum EdgeNeuralTTSClient {
         let dataBytes = Array(rawString.utf8)
         guard dataBytes.count >= 7 else { return "" }
 
-        // 1. _sha256_init(data[:7])
         var initWords = [UInt64](repeating: 0, count: 64)
         initWords[14] = (UInt64(dataBytes[0]) << 16) | (UInt64(dataBytes[1]) << 8) | UInt64(dataBytes[2])
         initWords[15] = (UInt64(dataBytes[3]) << 24) | (UInt64(dataBytes[4]) << 16) | (UInt64(dataBytes[5]) << 8) | UInt64(dataBytes[6])
@@ -1335,7 +1406,6 @@ private enum EdgeNeuralTTSClient {
             state[i] = (sha256Initial[i] &+ working[i]) & u32Mask
         }
 
-        // 2. _sha256_digest(data)
         let totalLen = 57 + dataBytes.count
         let remBytes = Array(dataBytes[7..<dataBytes.count])
         let padZeros = ((55 - (totalLen % 64)) % 64 + 64) % 64
@@ -1381,7 +1451,6 @@ private enum EdgeNeuralTTSClient {
             digestBytes[i * 4 + 3] = UInt8(word & 0xFF)
         }
 
-        // 3. _cs64_digest(data, digest)
         var keyA = UInt64(digestBytes[0]) | (UInt64(digestBytes[1]) << 8) | (UInt64(digestBytes[2]) << 16) | (UInt64(digestBytes[3]) << 24)
         var keyB = UInt64(digestBytes[4]) | (UInt64(digestBytes[5]) << 8) | (UInt64(digestBytes[6]) << 16) | (UInt64(digestBytes[7]) << 24)
         keyA |= 1

@@ -4,9 +4,18 @@ struct TableOfContentsSheetView: View {
     @ObservedObject var viewModel: AppViewModel
     @Environment(\.dismiss) private var dismiss
 
+    private var activeChapterIdInCurrentStory: String? {
+        if let selId = viewModel.selectedChapter?.id,
+           viewModel.chapters.contains(where: { $0.id == selId }) {
+            return selId
+        }
+        return viewModel.currentStorySavedState?.chapterId
+    }
+
     var body: some View {
         let palette = ThemePalette.forTheme(viewModel.readerTheme)
         let _ = viewModel.translatedRevisionTrigger
+        let activeChapterId = activeChapterIdInCurrentStory
 
         NavigationStack {
             VStack(spacing: 0) {
@@ -79,7 +88,6 @@ struct TableOfContentsSheetView: View {
                         }
                     }
 
-                    // Chỉnh tốc độ tự động cuộn ngay trong bảng Mục lục / Tùy chỉnh đọc (để màn hình đọc hoàn toàn sạch sẽ)
                     VStack(spacing: 6) {
                         HStack(spacing: 8) {
                             Label("Tốc độ cuộn: \(Int(viewModel.autoScrollSpeed))", systemImage: "arrow.down.circle")
@@ -147,7 +155,7 @@ struct TableOfContentsSheetView: View {
                 .padding(.vertical, 10)
                 .background(palette.background)
 
-                // Danh sách chương trong cụm: Tự động tạo mới ScrollView và cuộn lên đầu trang khi bấm sang cụm chương khác
+                // Danh sách chương trong cụm: Tự động nhảy thẳng tới đúng vị trí chương đang đọc ngay khi mở
                 ScrollViewReader { scrollProxy in
                     ScrollView {
                         LazyVStack(spacing: 8) {
@@ -157,7 +165,7 @@ struct TableOfContentsSheetView: View {
 
                             ForEach(Array(viewModel.currentTocSlice.enumerated()), id: \.element.id) { offset, chapter in
                                 let globalIndex = viewModel.tocStartIndex + offset
-                                let isCurrent = viewModel.selectedChapter?.id == chapter.id
+                                let isCurrent = activeChapterId == chapter.id
                                 let isTranslated = LocalChapterStorage.shared.isChapterTranslated(chapter.id)
 
                                 Button {
@@ -200,16 +208,20 @@ struct TableOfContentsSheetView: View {
                                     )
                                     .clipShape(RoundedRectangle(cornerRadius: 12))
                                 }
+                                .id(chapter.id)
                             }
                         }
                         .padding(14)
                     }
                     .id("TOC_SCROLL_\(viewModel.tocStartIndex)_\(viewModel.tocScrollResetToken)")
+                    .onAppear {
+                        scrollToActiveOrTop(proxy: scrollProxy, activeId: activeChapterId)
+                    }
                     .onChange(of: viewModel.tocStartIndex) { _ in
-                        scrollProxy.scrollTo("TOC_TOP_ANCHOR", anchor: .top)
+                        scrollToActiveOrTop(proxy: scrollProxy, activeId: activeChapterId)
                     }
                     .onChange(of: viewModel.tocScrollResetToken) { _ in
-                        scrollProxy.scrollTo("TOC_TOP_ANCHOR", anchor: .top)
+                        scrollToActiveOrTop(proxy: scrollProxy, activeId: activeChapterId)
                     }
                 }
                 .background(palette.background)
@@ -224,6 +236,19 @@ struct TableOfContentsSheetView: View {
                     .fontWeight(.bold)
                 }
             }
+        }
+    }
+
+    private func scrollToActiveOrTop(proxy: ScrollViewProxy, activeId: String?) {
+        if let activeId, viewModel.currentTocSlice.contains(where: { $0.id == activeId }) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+                proxy.scrollTo(activeId, anchor: .center)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
+                proxy.scrollTo(activeId, anchor: .center)
+            }
+        } else {
+            proxy.scrollTo("TOC_TOP_ANCHOR", anchor: .top)
         }
     }
 }
