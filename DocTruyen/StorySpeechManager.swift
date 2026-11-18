@@ -1572,9 +1572,12 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
 
     private static func findHTTPHeaderDelimiter(in buf: [UInt8]) -> Int? {
         guard buf.count >= 4 else { return nil }
-        let limit = buf.count - 4
+        let limit: Int = buf.count - 4
         for i in 0...limit {
-            if buf[i] == 0x0D && buf[i + 1] == 0x0A && buf[i + 2] == 0x0D && buf[i + 3] == 0x0A {
+            if buf[i] != 0x0D { continue }
+            if buf[i + 1] != 0x0A { continue }
+            if buf[i + 2] != 0x0D { continue }
+            if buf[i + 3] == 0x0A {
                 return i
             }
         }
@@ -1862,52 +1865,125 @@ private enum EdgeNeuralTTSClient {
     }
 
     // MARK: - Thuật toán Sec-MS-GEC v2 (<16-hex>-<64-hex>) chính xác theo rany2/edge-tts 7.3.1 drm.py
+    // Mọi phép toán bit được tách từng dòng đơn giản kèm kiểu tĩnh : UInt64 để swiftc biên dịch trong <0.01 giây
     private static func rol16(_ value: UInt64) -> UInt64 {
-        let v = value & u32Mask
-        return ((v << 16) | (v >> 16)) & u32Mask
+        let v: UInt64 = value & u32Mask
+        let shl: UInt64 = v << (16 as UInt64)
+        let shr: UInt64 = v >> (16 as UInt64)
+        let combined: UInt64 = shl | shr
+        return combined & u32Mask
     }
 
     private static func sigma0(_ value: UInt64) -> UInt64 {
-        let s1 = (value >> 7) ^ (value << 25)
-        let s2 = (value >> 18) ^ (value << 14)
-        return (s1 ^ s2 ^ (value >> 3)) & u32Mask
+        let a1: UInt64 = value >> (7 as UInt64)
+        let a2: UInt64 = value << (25 as UInt64)
+        let s1: UInt64 = a1 ^ a2
+        let b1: UInt64 = value >> (18 as UInt64)
+        let b2: UInt64 = value << (14 as UInt64)
+        let s2: UInt64 = b1 ^ b2
+        let c1: UInt64 = value >> (3 as UInt64)
+        let x1: UInt64 = s1 ^ s2
+        let x2: UInt64 = x1 ^ c1
+        return x2 & u32Mask
     }
 
     private static func sigma1(_ value: UInt64) -> UInt64 {
-        let s1 = (value >> 17) ^ (value << 15)
-        let s2 = (value >> 19) ^ (value << 13)
-        return (s1 ^ s2 ^ (value >> 10)) & u32Mask
+        let a1: UInt64 = value >> (17 as UInt64)
+        let a2: UInt64 = value << (15 as UInt64)
+        let s1: UInt64 = a1 ^ a2
+        let b1: UInt64 = value >> (19 as UInt64)
+        let b2: UInt64 = value << (13 as UInt64)
+        let s2: UInt64 = b1 ^ b2
+        let c1: UInt64 = value >> (10 as UInt64)
+        let x1: UInt64 = s1 ^ s2
+        let x2: UInt64 = x1 ^ c1
+        return x2 & u32Mask
+    }
+
+    private static func packBE32(_ b0: UInt8, _ b1: UInt8, _ b2: UInt8, _ b3: UInt8) -> UInt64 {
+        let u0: UInt64 = UInt64(b0) << (24 as UInt64)
+        let u1: UInt64 = UInt64(b1) << (16 as UInt64)
+        let u2: UInt64 = UInt64(b2) << (8 as UInt64)
+        let u3: UInt64 = UInt64(b3)
+        let hi: UInt64 = u0 | u1
+        let lo: UInt64 = u2 | u3
+        return hi | lo
+    }
+
+    private static func packLE32(_ b0: UInt8, _ b1: UInt8, _ b2: UInt8, _ b3: UInt8) -> UInt64 {
+        let u0: UInt64 = UInt64(b0)
+        let u1: UInt64 = UInt64(b1) << (8 as UInt64)
+        let u2: UInt64 = UInt64(b2) << (16 as UInt64)
+        let u3: UInt64 = UInt64(b3) << (24 as UInt64)
+        let lo: UInt64 = u0 | u1
+        let hi: UInt64 = u2 | u3
+        return lo | hi
+    }
+
+    private static func appendLE32Hex(of word: UInt64, to out: inout String) {
+        let b0: UInt64 = word & 0xFF
+        let s1: UInt64 = word >> (8 as UInt64)
+        let b1: UInt64 = s1 & 0xFF
+        let s2: UInt64 = word >> (16 as UInt64)
+        let b2: UInt64 = s2 & 0xFF
+        let s3: UInt64 = word >> (24 as UInt64)
+        let b3: UInt64 = s3 & 0xFF
+        out += String(format: "%02X%02X%02X%02X", b0, b1, b2, b3)
     }
 
     private static func sha256Rounds(state: inout [UInt64], words: [UInt64], firstRound: Int) {
-        var a = state[0]
-        var b = state[1]
-        var c = state[2]
-        var d = state[3]
-        var e = state[4]
-        var f = state[5]
-        var g = state[6]
-        var h = state[7]
+        var a: UInt64 = state[0]
+        var b: UInt64 = state[1]
+        var c: UInt64 = state[2]
+        var d: UInt64 = state[3]
+        var e: UInt64 = state[4]
+        var f: UInt64 = state[5]
+        var g: UInt64 = state[6]
+        var h: UInt64 = state[7]
 
         for i in firstRound..<64 {
-            let k: UInt64 = (firstRound == 14 && i == 14) ? 0xC9DC06A7 : sha256RoundConstants[i]
-            let rotE = e &* 0x100000001
-            let rotA = a &* 0x100000001
-            let sumE = (rotE >> 6) ^ (rotE >> 11) ^ (rotE >> 25)
-            let ch = g ^ (e & (f ^ g))
-            let t1 = h &+ sumE &+ ch &+ k &+ words[i]
-            let sumA = (rotA >> 2) ^ (rotA >> 13) ^ (rotA >> 22)
-            let maj = (a & b) | (c & (a | b))
-            let t2 = sumA &+ maj
+            let isSpecialRound: Bool = (firstRound == 14 && i == 14)
+            let k: UInt64 = isSpecialRound ? 0xC9DC06A7 : sha256RoundConstants[i]
+            let rotE: UInt64 = e &* 0x100000001
+            let rotA: UInt64 = a &* 0x100000001
+
+            let re1: UInt64 = rotE >> (6 as UInt64)
+            let re2: UInt64 = rotE >> (11 as UInt64)
+            let re3: UInt64 = rotE >> (25 as UInt64)
+            let re12: UInt64 = re1 ^ re2
+            let sumE: UInt64 = re12 ^ re3
+
+            let fg: UInt64 = f ^ g
+            let efg: UInt64 = e & fg
+            let ch: UInt64 = g ^ efg
+
+            let t1a: UInt64 = h &+ sumE
+            let t1b: UInt64 = t1a &+ ch
+            let t1c: UInt64 = t1b &+ k
+            let t1: UInt64 = t1c &+ words[i]
+
+            let ra1: UInt64 = rotA >> (2 as UInt64)
+            let ra2: UInt64 = rotA >> (13 as UInt64)
+            let ra3: UInt64 = rotA >> (22 as UInt64)
+            let ra12: UInt64 = ra1 ^ ra2
+            let sumA: UInt64 = ra12 ^ ra3
+
+            let ab: UInt64 = a & b
+            let aOrb: UInt64 = a | b
+            let cAndAB: UInt64 = c & aOrb
+            let maj: UInt64 = ab | cAndAB
+            let t2: UInt64 = sumA &+ maj
 
             h = g
             g = f
             f = e
-            e = (d &+ t1) & u32Mask
+            let dPlusT1: UInt64 = d &+ t1
+            e = dPlusT1 & u32Mask
             d = c
             c = b
             b = a
-            a = (t1 &+ t2) & u32Mask
+            let t1PlusT2: UInt64 = t1 &+ t2
+            a = t1PlusT2 & u32Mask
         }
 
         state[0] = a
@@ -1922,115 +1998,131 @@ private enum EdgeNeuralTTSClient {
 
     private static func expandSchedule(_ words: inout [UInt64], firstWord: Int) {
         for i in firstWord..<64 {
-            let x = words[i - 2]
-            let y = words[i - 15]
-            let s1 = (x >> 17) ^ (x << 15) ^ (x >> 19) ^ (x << 13) ^ (x >> 10)
-            let s0 = (y >> 7) ^ (y << 25) ^ (y >> 18) ^ (y << 14) ^ (y >> 3)
-            let sum = s1 &+ words[i - 7] &+ s0 &+ words[i - 16]
+            let s1: UInt64 = sigma1(words[i - 2])
+            let s0: UInt64 = sigma0(words[i - 15])
+            let p1: UInt64 = s1 &+ words[i - 7]
+            let p2: UInt64 = s0 &+ words[i - 16]
+            let sum: UInt64 = p1 &+ p2
             words[i] = sum & u32Mask
         }
     }
 
     static func generateSecMsGecV2(timestamp: TimeInterval) -> String {
         let winEpochOffset: Int64 = 11_644_473_600
-        let unixSeconds = Int64(timestamp)
-        let totalSeconds = unixSeconds + winEpochOffset
-        let roundedSeconds = totalSeconds - (totalSeconds % 300)
-        let fileTime = roundedSeconds * 10_000_000
+        let unixSeconds: Int64 = Int64(timestamp)
+        let totalSeconds: Int64 = unixSeconds + winEpochOffset
+        let rem300: Int64 = totalSeconds % 300
+        let roundedSeconds: Int64 = totalSeconds - rem300
+        let fileTime: Int64 = roundedSeconds * 10_000_000
         let rawString = "\(fileTime)\(trustedToken)"
-        let dataBytes = Array(rawString.utf8)
+        let dataBytes: [UInt8] = Array(rawString.utf8)
         guard dataBytes.count >= 7 else { return "" }
 
         var initWords = [UInt64](repeating: 0, count: 64)
-        initWords[14] = (UInt64(dataBytes[0]) << 16) | (UInt64(dataBytes[1]) << 8) | UInt64(dataBytes[2])
-        initWords[15] = (UInt64(dataBytes[3]) << 24) | (UInt64(dataBytes[4]) << 16) | (UInt64(dataBytes[5]) << 8) | UInt64(dataBytes[6])
+        initWords[14] = packBE32(0, dataBytes[0], dataBytes[1], dataBytes[2])
+        initWords[15] = packBE32(dataBytes[3], dataBytes[4], dataBytes[5], dataBytes[6])
 
         for i in 16..<30 {
-            var v = sha256Schedule[i - 16]
+            var v: UInt64 = sha256Schedule[i - 16]
             if i - 2 >= 14 {
-                let s1 = sigma1(initWords[i - 2])
-                v = v &+ ((i == 16) ? (s1 ^ 0x000B92C0) : s1)
+                let s1: UInt64 = sigma1(initWords[i - 2])
+                let adj1: UInt64 = (i == 16) ? (s1 ^ 0x000B92C0) : s1
+                v = v &+ adj1
             }
             if i - 7 >= 14 {
                 v = v &+ initWords[i - 7]
             }
             if i - 15 >= 14 {
-                let s0 = sigma0(initWords[i - 15])
-                v = v &+ ((i == 29) ? (s0 ^ 0x059C0B80) : s0)
+                let s0: UInt64 = sigma0(initWords[i - 15])
+                let adj0: UInt64 = (i == 29) ? (s0 ^ 0x059C0B80) : s0
+                v = v &+ adj0
             }
             initWords[i] = v & u32Mask
         }
 
-        let w30 = sigma1(initWords[28]) &+ initWords[23] &+ sigma0(initWords[15]) &+ initWords[14] &+ 0xC9DC06A7 &- sha256RoundConstants[14]
+        let w30a: UInt64 = sigma1(initWords[28]) &+ initWords[23]
+        let w30b: UInt64 = sigma0(initWords[15]) &+ initWords[14]
+        let w30c: UInt64 = w30a &+ w30b
+        let w30d: UInt64 = w30c &+ (0xC9DC06A7 as UInt64)
+        let w30: UInt64 = w30d &- sha256RoundConstants[14]
         initWords[30] = w30 & u32Mask
         expandSchedule(&initWords, firstWord: 31)
 
-        var working = sha256State
+        var working: [UInt64] = sha256State
         sha256Rounds(state: &working, words: initWords, firstRound: 14)
 
         var state = [UInt64](repeating: 0, count: 8)
         for i in 0..<8 {
-            state[i] = (sha256Initial[i] &+ working[i]) & u32Mask
+            let sumState: UInt64 = sha256Initial[i] &+ working[i]
+            state[i] = sumState & u32Mask
         }
 
-        let totalLen = 57 + dataBytes.count
-        let remBytes = Array(dataBytes[7..<dataBytes.count])
-        let padZeros = ((55 - (totalLen % 64)) % 64 + 64) % 64
+        let totalLen: Int = 57 + dataBytes.count
+        let remBytes: [UInt8] = Array(dataBytes[7..<dataBytes.count])
+        let mod64: Int = totalLen % 64
+        let diff55: Int = (55 - mod64) % 64
+        let padZeros: Int = (diff55 + 64) % 64
 
         var padded = [UInt8]()
-        padded.reserveCapacity(remBytes.count + 1 + padZeros + 8)
+        padded.reserveCapacity(remBytes.count + 9 + padZeros)
         padded.append(contentsOf: remBytes)
         padded.append(0x80)
         for _ in 0..<padZeros {
             padded.append(0x00)
         }
-        let bitLen = UInt64(totalLen) * 8
+        let bitLen: UInt64 = UInt64(totalLen) * (8 as UInt64)
         for shift in stride(from: 56, through: 0, by: -8) {
-            padded.append(UInt8((bitLen >> UInt64(shift)) & 0xFF))
+            let shifted: UInt64 = bitLen >> UInt64(shift)
+            let byteVal: UInt8 = UInt8(shifted & 0xFF)
+            padded.append(byteVal)
         }
 
-        var offset = 0
+        var offset: Int = 0
         while offset < padded.count {
             var blockWords = [UInt64](repeating: 0, count: 64)
             for i in 0..<16 {
-                let p = offset + i * 4
-                let b0 = UInt64(padded[p]) << 24
-                let b1 = UInt64(padded[p + 1]) << 16
-                let b2 = UInt64(padded[p + 2]) << 8
-                let b3 = UInt64(padded[p + 3])
-                blockWords[i] = b0 | b1 | b2 | b3
+                let p: Int = offset + (i * 4)
+                blockWords[i] = packBE32(padded[p], padded[p + 1], padded[p + 2], padded[p + 3])
             }
             expandSchedule(&blockWords, firstWord: 16)
-            var blkWorking = state
+            var blkWorking: [UInt64] = state
             sha256Rounds(state: &blkWorking, words: blockWords, firstRound: 0)
             for i in 0..<8 {
-                state[i] = (state[i] &+ blkWorking[i]) & u32Mask
+                let nextS: UInt64 = state[i] &+ blkWorking[i]
+                state[i] = nextS & u32Mask
             }
             offset += 64
         }
 
         var digestBytes = [UInt8](repeating: 0, count: 32)
         for i in 0..<8 {
-            let word = state[i]
-            digestBytes[i * 4 + 0] = UInt8((word >> 24) & 0xFF)
-            digestBytes[i * 4 + 1] = UInt8((word >> 16) & 0xFF)
-            digestBytes[i * 4 + 2] = UInt8((word >> 8) & 0xFF)
-            digestBytes[i * 4 + 3] = UInt8(word & 0xFF)
+            let word: UInt64 = state[i]
+            let baseIdx: Int = i * 4
+            let s24: UInt64 = word >> (24 as UInt64)
+            let s16: UInt64 = word >> (16 as UInt64)
+            let s8: UInt64 = word >> (8 as UInt64)
+            digestBytes[baseIdx] = UInt8(s24 & 0xFF)
+            digestBytes[baseIdx + 1] = UInt8(s16 & 0xFF)
+            digestBytes[baseIdx + 2] = UInt8(s8 & 0xFF)
+            digestBytes[baseIdx + 3] = UInt8(word & 0xFF)
         }
 
-        var keyA = UInt64(digestBytes[0]) | (UInt64(digestBytes[1]) << 8) | (UInt64(digestBytes[2]) << 16) | (UInt64(digestBytes[3]) << 24)
-        var keyB = UInt64(digestBytes[4]) | (UInt64(digestBytes[5]) << 8) | (UInt64(digestBytes[6]) << 16) | (UInt64(digestBytes[7]) << 24)
-        keyA |= 1
-        keyB |= 1
+        var keyA: UInt64 = packLE32(digestBytes[0], digestBytes[1], digestBytes[2], digestBytes[3])
+        var keyB: UInt64 = packLE32(digestBytes[4], digestBytes[5], digestBytes[6], digestBytes[7])
+        keyA |= (1 as UInt64)
+        keyB |= (1 as UInt64)
 
-        let factor0 = (keyA &* 0x82893933) & u32Mask
-        let factor1 = (keyB &* 0x82893933) & u32Mask
+        let rawF0: UInt64 = keyA &* 0x82893933
+        let rawF1: UInt64 = keyB &* 0x82893933
+        let factor0: UInt64 = rawF0 & u32Mask
+        let factor1: UInt64 = rawF1 & u32Mask
 
         var terms = [UInt64]()
         var offsets = [UInt64]()
         for i in 0..<14 {
-            let f = (i % 2 == 0) ? factor0 : factor1
-            terms.append((cs64CoeffA[i] &* f) & u32Mask)
+            let f: UInt64 = (i % 2 == 0) ? factor0 : factor1
+            let prod: UInt64 = cs64CoeffA[i] &* f
+            terms.append(prod & u32Mask)
             offsets.append(cs64CoeffB[i])
         }
 
@@ -2042,9 +2134,9 @@ private enum EdgeNeuralTTSClient {
         }
 
         var leWords = [UInt64]()
-        var pIdx = 0
+        var pIdx: Int = 0
         while pIdx < prefixed.count {
-            let w = UInt64(prefixed[pIdx]) | (UInt64(prefixed[pIdx + 1]) << 8) | (UInt64(prefixed[pIdx + 2]) << 16) | (UInt64(prefixed[pIdx + 3]) << 24)
+            let w: UInt64 = packLE32(prefixed[pIdx], prefixed[pIdx + 1], prefixed[pIdx + 2], prefixed[pIdx + 3])
             leWords.append(w)
             pIdx += 4
         }
@@ -2053,13 +2145,16 @@ private enum EdgeNeuralTTSClient {
         }
 
         for (idx, word) in leWords.enumerated() {
-            let k = (idx % 2 == 0) ? keyA : keyB
-            let c: UInt64 = (idx % 2 == 0) ? 0xEF0569FB : 0xC31713DB
-            var term = word &* k
-            var off = rol16(word) &* c
+            let isEven: Bool = (idx % 2 == 0)
+            let k: UInt64 = isEven ? keyA : keyB
+            let c: UInt64 = isEven ? 0xEF0569FB : 0xC31713DB
+            var term: UInt64 = word &* k
+            let rWord: UInt64 = rol16(word)
+            var off: UInt64 = rWord &* c
             if idx == 0 {
-                term = term &+ (0xF2F90B1A &* factor0)
-                off = off &+ 0x0B1A0000
+                let extraTerm: UInt64 = (0xF2F90B1A as UInt64) &* factor0
+                term = term &+ extraTerm
+                off = off &+ (0x0B1A0000 as UInt64)
             }
             terms.append(term & u32Mask)
             offsets.append(off & u32Mask)
@@ -2070,48 +2165,53 @@ private enum EdgeNeuralTTSClient {
         var st: UInt64 = 0
         var acc: UInt64 = 0
 
-        var tIdx = 0
+        var tIdx: Int = 0
         while tIdx < terms.count {
-            let x = terms[tIdx]
-            let y = terms[tIdx + 1]
+            let x: UInt64 = terms[tIdx]
+            let y: UInt64 = terms[tIdx + 1]
 
-            let t0 = rol16((offsets[tIdx] &+ x) & u32Mask)
-            let q0 = (t0 &* 0x76F50F34) & u32Mask
-            swapAcc = swapAcc &+ ((rol16(q0) &* 0xC3EFEA97 &+ q0) & u32Mask)
+            let ox: UInt64 = (offsets[tIdx] &+ x) & u32Mask
+            let t0: UInt64 = rol16(ox)
+            let q0: UInt64 = (t0 &* 0x76F50F34) & u32Mask
+            let rq0: UInt64 = rol16(q0) &* 0xC3EFEA97
+            let rq0Sum: UInt64 = (rq0 &+ q0) & u32Mask
+            swapAcc = swapAcc &+ rq0Sum
 
-            let t1 = rol16((offsets[tIdx + 1] &+ y) & u32Mask)
-            let q1 = (t1 &* 0x1881CE3C) & u32Mask
-            swapLast = (rol16(q1) &* 0x35BD1EC9 &+ q1) & u32Mask
-            swapAcc = (swapAcc &+ swapLast) & u32Mask
+            let oy: UInt64 = (offsets[tIdx + 1] &+ y) & u32Mask
+            let t1: UInt64 = rol16(oy)
+            let q1: UInt64 = (t1 &* 0x1881CE3C) & u32Mask
+            let rq1: UInt64 = rol16(q1) &* 0x35BD1EC9
+            swapLast = (rq1 &+ q1) & u32Mask
+            let nextSwapAcc: UInt64 = swapAcc &+ swapLast
+            swapAcc = nextSwapAcc & u32Mask
 
-            st = (st &* keyA &+ x) & u32Mask
+            let stA: UInt64 = st &* keyA
+            st = (stA &+ x) & u32Mask
             st = (rol16(st) &* 0xCF98B111) & u32Mask
             st = (rol16(st) &* 0x87085B9F) & u32Mask
             st = (rol16(st) &* 0x12CEB96D) & u32Mask
             st = (rol16(st) &* 0x257E1D83) & u32Mask
             acc = acc &+ st
 
-            var tm = (st &* keyB &+ y) & u32Mask
+            let stB: UInt64 = st &* keyB
+            var tm: UInt64 = (stB &+ y) & u32Mask
             tm = (rol16(tm) &* 0xA27416F5) & u32Mask
             tm = (rol16(tm) &* 0xD38396FF) & u32Mask
-            let inner = (rol16(tm) &* 0x7C932B89) & u32Mask
+            let inner: UInt64 = (rol16(tm) &* 0x7C932B89) & u32Mask
             st = (rol16(inner) &* 0xBFA49F69) & u32Mask
-            acc = (acc &+ st) & u32Mask
+            let nextAcc: UInt64 = acc &+ st
+            acc = nextAcc & u32Mask
 
             tIdx += 2
         }
 
-        let cs0 = (swapLast ^ st) & u32Mask
-        let cs1 = (swapAcc ^ acc) & u32Mask
-        let csBytes: [UInt8] = [
-            UInt8(cs0 & 0xFF), UInt8((cs0 >> 8) & 0xFF), UInt8((cs0 >> 16) & 0xFF), UInt8((cs0 >> 24) & 0xFF),
-            UInt8(cs1 & 0xFF), UInt8((cs1 >> 8) & 0xFF), UInt8((cs1 >> 16) & 0xFF), UInt8((cs1 >> 24) & 0xFF)
-        ]
+        let cs0: UInt64 = (swapLast ^ st) & u32Mask
+        let cs1: UInt64 = (swapAcc ^ acc) & u32Mask
 
         var csHex = ""
-        for b in csBytes {
-            csHex += String(format: "%02X", b)
-        }
+        appendLE32Hex(of: cs0, to: &csHex)
+        appendLE32Hex(of: cs1, to: &csHex)
+
         var shaHex = ""
         for b in digestBytes {
             shaHex += String(format: "%02X", b)
