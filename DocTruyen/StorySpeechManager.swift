@@ -15,11 +15,11 @@ enum StoryVoiceChoice: String, CaseIterable, Identifiable, Codable {
 
     var displayName: String {
         switch self {
-        case .namMinh: return "Nam Minh (AI Trầm ấm - Không giới hạn)"
-        case .hoaiMy: return "Hoài My (AI Truyền cảm - Không giới hạn)"
-        case .geminiKore: return "Gemini AI Nữ (Kore - Giới hạn Quota Free)"
-        case .geminiPuck: return "Gemini AI Nam (Puck - Giới hạn Quota Free)"
-        case .googleVi: return "Chị Google (Dự phòng nhanh)"
+        case .namMinh: return "Nam Minh (AI Trầm ấm)"
+        case .hoaiMy: return "Hoài My (AI Truyền cảm)"
+        case .geminiKore: return "Gemini AI Nữ (Kore)"
+        case .geminiPuck: return "Gemini AI Nam (Puck)"
+        case .googleVi: return "Chị Google (Dự phòng)"
         }
     }
 
@@ -52,17 +52,13 @@ enum StoryVoiceChoice: String, CaseIterable, Identifiable, Codable {
     }
 }
 
-// MARK: - Các Struct Codable định kiểu tĩnh 100% giúp trình biên dịch Swift biên dịch tức thì trong < 0.5 giây (Không dùng [String: Any] lồng nhau)
+// MARK: - Codable Struct chuẩn cho Gemini TTS (Không chứa safetySettings hay systemInstruction để tránh lỗi HTTP 400 trên endpoint TTS)
 private struct GeminiTTSRequestPayload: Encodable {
     struct Content: Encodable {
         struct Part: Encodable {
             let text: String
         }
         let parts: [Part]
-    }
-    struct SafetySetting: Encodable {
-        let category: String
-        let threshold: String
     }
     struct GenerationConfig: Encodable {
         struct SpeechConfig: Encodable {
@@ -79,7 +75,6 @@ private struct GeminiTTSRequestPayload: Encodable {
     }
 
     let contents: [Content]
-    let safetySettings: [SafetySetting]
     let generationConfig: GenerationConfig
 }
 
@@ -396,7 +391,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // MARK: - Phát từng đoạn & tải trước tuần tự (Chống nghẽn song song làm rớt về giọng Google)
+    // MARK: - Phát từng đoạn & tải trước tuần tự
     private func playCurrentChunk() {
         let sessionToken = playSessionToken
         guard currentChunkIndex >= 0, currentChunkIndex < chunks.count else {
@@ -481,10 +476,12 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
         switch voice {
         case .namMinh, .hoaiMy:
+            // 1. Ưu tiên tuyệt đối Edge Neural AI v2 (Sec-MS-GEC v2 2-143.0.3650.75)
             if let edgeData = await EdgeNeuralTTSClient.synthesize(text: cleaned, voiceName: voice.edgeVoiceName),
                edgeData.count > 200 {
                 return edgeData
             }
+            // 2. Dự phòng sang Gemini TTS (3.1 Flash TTS / 2.5 Flash TTS)
             if !geminiApiKey.isEmpty {
                 if let geminiAudio = await GeminiTTSClient.synthesize(
                     text: cleaned,
@@ -494,12 +491,14 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     return geminiAudio
                 }
             }
+            // 3. Dự phòng cuối cùng
             if let googleData = await GoogleTranslateTTSClient.synthesize(text: cleaned),
                googleData.count > 200 {
                 return googleData
             }
 
         case .geminiKore, .geminiPuck:
+            // 1. Ưu tiên Gemini TTS (xoay vòng 3 model: gemini-3.1-flash-tts-preview -> gemini-2.5-flash-preview-tts -> gemini-2.5-flash-lite-preview-tts)
             if !geminiApiKey.isEmpty {
                 if let geminiAudio = await GeminiTTSClient.synthesize(
                     text: cleaned,
@@ -509,10 +508,12 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     return geminiAudio
                 }
             }
+            // 2. Dự phòng sang Edge Neural AI v2 cùng giới tính giọng (Hoài My / Nam Minh)
             if let edgeData = await EdgeNeuralTTSClient.synthesize(text: cleaned, voiceName: voice.edgeVoiceName),
                edgeData.count > 200 {
                 return edgeData
             }
+            // 3. Dự phòng cuối cùng
             if let googleData = await GoogleTranslateTTSClient.synthesize(text: cleaned),
                googleData.count > 200 {
                 return googleData
@@ -701,7 +702,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             }
         }
 
-        let maxChunkLen = 145
+        let maxChunkLen = 175
 
         for (lineIdx, rawLine) in rawLines.enumerated() {
             let linecleaned = Self.sanitizeLineForSpeech(rawLine)
@@ -808,36 +809,41 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 }
 
-// MARK: - Gemini 2.5 Flash Native Audio TTS Client (Dùng Codable Struct 100% không gây treo Type-Checker)
+// MARK: - Gemini 3.1 / 2.5 Flash Native Audio TTS Client
 private enum GeminiTTSClient {
     private static let stateLock = NSLock()
-    private static var quotaCooldownUntil: TimeInterval = 0
+    private static var cooldownByModel: [String: TimeInterval] = [:]
 
     private static let candidateTTSModels: [String] = [
+        "gemini-3.1-flash-tts-preview",
         "gemini-2.5-flash-preview-tts",
-        "gemini-2.5-flash-tts"
+        "gemini-2.5-flash-lite-preview-tts"
     ]
 
-    private static func isInQuotaCooldown() -> Bool {
+    private static func isModelCoolingDown(_ model: String) -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return Date().timeIntervalSince1970 < quotaCooldownUntil
+        guard let until = cooldownByModel[model] else { return false }
+        return Date().timeIntervalSince1970 < until
     }
 
-    private static func markQuotaCooldown(seconds: TimeInterval) {
+    private static func markModelCooldown(_ model: String, seconds: TimeInterval) {
         stateLock.lock()
-        quotaCooldownUntil = Date().timeIntervalSince1970 + seconds
+        cooldownByModel[model] = Date().timeIntervalSince1970 + seconds
         stateLock.unlock()
     }
 
     static func synthesize(text: String, voiceName: String, apiKey: String) async -> Data? {
         let cleanKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanKey.isEmpty, !trimmed.isEmpty, !isInQuotaCooldown() else {
+        guard !cleanKey.isEmpty, !trimmed.isEmpty else {
             return nil
         }
 
         for model in candidateTTSModels {
+            if isModelCoolingDown(model) {
+                continue
+            }
             let result = await callGeminiAudioEndpoint(
                 model: model,
                 text: trimmed,
@@ -848,8 +854,9 @@ private enum GeminiTTSClient {
             case .success(let wavData):
                 return wavData
             case .rateLimited:
-                markQuotaCooldown(seconds: 25)
-                return nil
+                // Chỉ đánh dấu cooldown trên nhánh model bị 429 và thử ngay sang model TTS tiếp theo
+                markModelCooldown(model, seconds: 22)
+                continue
             case .tryNextModel:
                 continue
             }
@@ -872,19 +879,13 @@ private enum GeminiTTSClient {
         let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)"
         guard let url = URL(string: urlString) else { return .tryNextModel }
 
-        let part = GeminiTTSRequestPayload.Content.Part(text: "Read aloud in Vietnamese:\n\(text)")
+        let part = GeminiTTSRequestPayload.Content.Part(text: text)
         let content = GeminiTTSRequestPayload.Content(parts: [part])
-        let safety: [GeminiTTSRequestPayload.SafetySetting] = [
-            GeminiTTSRequestPayload.SafetySetting(category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE"),
-            GeminiTTSRequestPayload.SafetySetting(category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE"),
-            GeminiTTSRequestPayload.SafetySetting(category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE"),
-            GeminiTTSRequestPayload.SafetySetting(category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE")
-        ]
         let prebuilt = GeminiTTSRequestPayload.GenerationConfig.SpeechConfig.VoiceConfig.PrebuiltVoiceConfig(voiceName: voiceName)
         let voiceCfg = GeminiTTSRequestPayload.GenerationConfig.SpeechConfig.VoiceConfig(prebuiltVoiceConfig: prebuilt)
         let speechCfg = GeminiTTSRequestPayload.GenerationConfig.SpeechConfig(voiceConfig: voiceCfg)
         let genCfg = GeminiTTSRequestPayload.GenerationConfig(responseModalities: ["AUDIO"], speechConfig: speechCfg)
-        let payload = GeminiTTSRequestPayload(contents: [content], safetySettings: safety, generationConfig: genCfg)
+        let payload = GeminiTTSRequestPayload(contents: [content], generationConfig: genCfg)
 
         guard let bodyData = try? JSONEncoder().encode(payload) else {
             return .tryNextModel
@@ -994,13 +995,57 @@ private enum GeminiTTSClient {
     }
 }
 
-// MARK: - Microsoft Edge Neural TTS WebSocket Client
+// MARK: - Microsoft Edge Neural TTS WebSocket Client (Chuẩn Sec-MS-GEC v2 <16-hex>-<64-hex> & 2-143.0.3650.75 theo edge-tts 7.3.1)
 private enum EdgeNeuralTTSClient {
     private static let trustedToken = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
-    private static let secMsGecVersion = "1-130.0.2849.68"
+    private static let secMsGecVersion = "2-143.0.3650.75"
     private static let clockLock = NSLock()
     private static var serverTimeOffsetSeconds: TimeInterval = 0
     private static var hasSyncedServerClock: Bool = false
+
+    private static let u32Mask: UInt64 = 0xFFFFFFFF
+
+    private static let sha256Initial: [UInt64] = [
+        0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
+        0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19
+    ]
+
+    private static let sha256State: [UInt64] = [
+        0xFD9FBEA2, 0x91243CE7, 0xBE499094, 0xCD2E1E0A,
+        0x6C006F49, 0x04BD35AB, 0xFEB0A7E4, 0x03EFFBD2
+    ]
+
+    private static let sha256Schedule: [UInt64] = [
+        0xEB24BF9E, 0x1558691F, 0xA0C09EE2, 0x0CFA32BA,
+        0xA622EE8C, 0xD1DD9491, 0xC0DD25A0, 0xF9E70AB6,
+        0xF0C31573, 0x7058CE4E, 0x7188E606, 0x00E5AB33,
+        0xD258B060, 0x72766564
+    ]
+
+    private static let sha256RoundConstants: [UInt64] = [
+        0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5,
+        0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3, 0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xC19BF174,
+        0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC, 0x2DE92C6F, 0x4A7484AA, 0x5CB0A9DC, 0x76F988DA,
+        0x983E5152, 0xA831C66D, 0xB00327C8, 0xBF597FC7, 0xC6E00BF3, 0xD5A79147, 0x06CA6351, 0x14292967,
+        0x27B70A85, 0x2E1B2138, 0x4D2C6DFC, 0x53380D13, 0x650A7354, 0x766A0ABB, 0x81C2C92E, 0x92722C85,
+        0xA2BFE8A1, 0xA81A664B, 0xC24B8B70, 0xC76C51A3, 0xD192E819, 0xD6990624, 0xF40E3585, 0x106AA070,
+        0x19A4C116, 0x1E376C08, 0x2748774C, 0x34B0BCB5, 0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3,
+        0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2
+    ]
+
+    private static let cs64CoeffA: [UInt64] = [
+        0xE82E91B1, 0x44DE24C6, 0x3BEB65BC, 0xC89C5933,
+        0x8D1EC211, 0x314EF5D5, 0xE92491B1, 0xF0A5B9D5,
+        0x06064CF3, 0xDA79FA60, 0xBED20560, 0x89F9C9F8,
+        0x35FA38C6, 0xCB49E3C6
+    ]
+
+    private static let cs64CoeffB: [UInt64] = [
+        0xB32700D0, 0x88DFF51D, 0x29514038, 0xB328CBDF,
+        0xD405B4D5, 0x26E55F3C, 0x607801C6, 0x82B2C1FB,
+        0xFA51A3DA, 0x207CC464, 0x3C3C74F3, 0xD2D14B61,
+        0xBB04A2C1, 0xC5626167
+    ]
 
     static func synthesize(text: String, voiceName: String) async -> Data? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1096,21 +1141,23 @@ private enum EdgeNeuralTTSClient {
     private static func performWebSocketSynthesize(text: String, voiceName: String) async -> Data? {
         let connectionId = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         let nowTimestamp = currentSyncedTimestamp()
-        let secMsGec = generateSecMsGec(timestamp: nowTimestamp)
-        let urlString = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=\(trustedToken)&Sec-MS-GEC=\(secMsGec)&Sec-MS-GEC-Version=\(secMsGecVersion)&ConnectionId=\(connectionId)"
+        let secMsGec = generateSecMsGecV2(timestamp: nowTimestamp)
+        let urlString = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=\(trustedToken)&ConnectionId=\(connectionId)&Sec-MS-GEC=\(secMsGec)&Sec-MS-GEC-Version=\(secMsGecVersion)"
         guard let url = URL(string: urlString) else { return nil }
 
         let muid = UUID().uuidString.replacingOccurrences(of: "-", with: "").uppercased()
         var request = URLRequest(url: url)
         request.timeoutInterval = 10
         request.setValue("chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold", forHTTPHeaderField: "Origin")
-        request.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0", forHTTPHeaderField: "User-Agent")
-        request.setValue("MUID=\(muid);", forHTTPHeaderField: "Cookie")
+        request.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("muid=\(muid);", forHTTPHeaderField: "Cookie")
         request.setValue("no-cache", forHTTPHeaderField: "Pragma")
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
 
         let config = URLSessionConfiguration.ephemeral
+        config.httpShouldSetCookies = false
+        config.httpCookieAcceptPolicy = .never
         config.timeoutIntervalForRequest = 10
         config.timeoutIntervalForResource = 12
         let session = URLSession(configuration: config)
@@ -1124,7 +1171,7 @@ private enum EdgeNeuralTTSClient {
             }
 
             let timestamp = formatEdgeTimestamp(from: nowTimestamp)
-            let configPayload = "X-Timestamp:\(timestamp)\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}"
+            let configPayload = "X-Timestamp:\(timestamp)\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"true\",\"wordBoundaryEnabled\":\"false\"},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}\r\n"
 
             let escapedText = text
                 .replacingOccurrences(of: "&", with: "&amp;")
@@ -1134,8 +1181,8 @@ private enum EdgeNeuralTTSClient {
                 .replacingOccurrences(of: "'", with: "&apos;")
 
             let reqId = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-            let ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='vi-VN'><voice name='\(voiceName)'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>\(escapedText)</prosody></voice></speak>"
-            let ssmlPayload = "X-RequestId:\(reqId)\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:\(timestamp)\r\nPath:ssml\r\n\r\n\(ssml)"
+            let ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='\(voiceName)'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>\(escapedText)</prosody></voice></speak>"
+            let ssmlPayload = "X-RequestId:\(reqId)\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:\(timestamp)Z\r\nPath:ssml\r\n\r\n\(ssml)"
 
             do {
                 try await ws.send(.string(configPayload))
@@ -1175,19 +1222,265 @@ private enum EdgeNeuralTTSClient {
         }
     }
 
-    private static func generateSecMsGec(timestamp: TimeInterval) -> String {
+    // MARK: - Thuật toán Sec-MS-GEC v2 (<16-hex>-<64-hex>) chính xác theo rany2/edge-tts 7.3.1 drm.py
+    private static func rol16(_ value: UInt64) -> UInt64 {
+        let v = value & u32Mask
+        return ((v << 16) | (v >> 16)) & u32Mask
+    }
+
+    private static func sigma0(_ value: UInt64) -> UInt64 {
+        let s1 = (value >> 7) ^ (value << 25)
+        let s2 = (value >> 18) ^ (value << 14)
+        return (s1 ^ s2 ^ (value >> 3)) & u32Mask
+    }
+
+    private static func sigma1(_ value: UInt64) -> UInt64 {
+        let s1 = (value >> 17) ^ (value << 15)
+        let s2 = (value >> 19) ^ (value << 13)
+        return (s1 ^ s2 ^ (value >> 10)) & u32Mask
+    }
+
+    private static func sha256Rounds(state: inout [UInt64], words: [UInt64], firstRound: Int) {
+        var a = state[0]
+        var b = state[1]
+        var c = state[2]
+        var d = state[3]
+        var e = state[4]
+        var f = state[5]
+        var g = state[6]
+        var h = state[7]
+
+        for i in firstRound..<64 {
+            let k: UInt64 = (firstRound == 14 && i == 14) ? 0xC9DC06A7 : sha256RoundConstants[i]
+            let rotE = e &* 0x100000001
+            let rotA = a &* 0x100000001
+            let sumE = (rotE >> 6) ^ (rotE >> 11) ^ (rotE >> 25)
+            let ch = g ^ (e & (f ^ g))
+            let t1 = h &+ sumE &+ ch &+ k &+ words[i]
+            let sumA = (rotA >> 2) ^ (rotA >> 13) ^ (rotA >> 22)
+            let maj = (a & b) | (c & (a | b))
+            let t2 = sumA &+ maj
+
+            h = g
+            g = f
+            f = e
+            e = (d &+ t1) & u32Mask
+            d = c
+            c = b
+            b = a
+            a = (t1 &+ t2) & u32Mask
+        }
+
+        state[0] = a
+        state[1] = b
+        state[2] = c
+        state[3] = d
+        state[4] = e
+        state[5] = f
+        state[6] = g
+        state[7] = h
+    }
+
+    private static func expandSchedule(_ words: inout [UInt64], firstWord: Int) {
+        for i in firstWord..<64 {
+            let x = words[i - 2]
+            let y = words[i - 15]
+            let s1 = (x >> 17) ^ (x << 15) ^ (x >> 19) ^ (x << 13) ^ (x >> 10)
+            let s0 = (y >> 7) ^ (y << 25) ^ (y >> 18) ^ (y << 14) ^ (y >> 3)
+            let sum = s1 &+ words[i - 7] &+ s0 &+ words[i - 16]
+            words[i] = sum & u32Mask
+        }
+    }
+
+    static func generateSecMsGecV2(timestamp: TimeInterval) -> String {
         let winEpochOffset: Int64 = 11_644_473_600
         let unixSeconds = Int64(timestamp)
         let totalSeconds = unixSeconds + winEpochOffset
         let roundedSeconds = totalSeconds - (totalSeconds % 300)
         let fileTime = roundedSeconds * 10_000_000
-        let raw = "\(fileTime)\(trustedToken)"
-        let digest = SHA256.hash(data: Data(raw.utf8))
-        var hexResult = ""
-        for byte in digest {
-            hexResult += String(format: "%02X", byte)
+        let rawString = "\(fileTime)\(trustedToken)"
+        let dataBytes = Array(rawString.utf8)
+        guard dataBytes.count >= 7 else { return "" }
+
+        // 1. _sha256_init(data[:7])
+        var initWords = [UInt64](repeating: 0, count: 64)
+        initWords[14] = (UInt64(dataBytes[0]) << 16) | (UInt64(dataBytes[1]) << 8) | UInt64(dataBytes[2])
+        initWords[15] = (UInt64(dataBytes[3]) << 24) | (UInt64(dataBytes[4]) << 16) | (UInt64(dataBytes[5]) << 8) | UInt64(dataBytes[6])
+
+        for i in 16..<30 {
+            var v = sha256Schedule[i - 16]
+            if i - 2 >= 14 {
+                let s1 = sigma1(initWords[i - 2])
+                v = v &+ ((i == 16) ? (s1 ^ 0x000B92C0) : s1)
+            }
+            if i - 7 >= 14 {
+                v = v &+ initWords[i - 7]
+            }
+            if i - 15 >= 14 {
+                let s0 = sigma0(initWords[i - 15])
+                v = v &+ ((i == 29) ? (s0 ^ 0x059C0B80) : s0)
+            }
+            initWords[i] = v & u32Mask
         }
-        return hexResult
+
+        let w30 = sigma1(initWords[28]) &+ initWords[23] &+ sigma0(initWords[15]) &+ initWords[14] &+ 0xC9DC06A7 &- sha256RoundConstants[14]
+        initWords[30] = w30 & u32Mask
+        expandSchedule(&initWords, firstWord: 31)
+
+        var working = sha256State
+        sha256Rounds(state: &working, words: initWords, firstRound: 14)
+
+        var state = [UInt64](repeating: 0, count: 8)
+        for i in 0..<8 {
+            state[i] = (sha256Initial[i] &+ working[i]) & u32Mask
+        }
+
+        // 2. _sha256_digest(data)
+        let totalLen = 57 + dataBytes.count
+        let remBytes = Array(dataBytes[7..<dataBytes.count])
+        let padZeros = ((55 - (totalLen % 64)) % 64 + 64) % 64
+
+        var padded = [UInt8]()
+        padded.reserveCapacity(remBytes.count + 1 + padZeros + 8)
+        padded.append(contentsOf: remBytes)
+        padded.append(0x80)
+        for _ in 0..<padZeros {
+            padded.append(0x00)
+        }
+        let bitLen = UInt64(totalLen) * 8
+        for shift in stride(from: 56, through: 0, by: -8) {
+            padded.append(UInt8((bitLen >> UInt64(shift)) & 0xFF))
+        }
+
+        var offset = 0
+        while offset < padded.count {
+            var blockWords = [UInt64](repeating: 0, count: 64)
+            for i in 0..<16 {
+                let p = offset + i * 4
+                let b0 = UInt64(padded[p]) << 24
+                let b1 = UInt64(padded[p + 1]) << 16
+                let b2 = UInt64(padded[p + 2]) << 8
+                let b3 = UInt64(padded[p + 3])
+                blockWords[i] = b0 | b1 | b2 | b3
+            }
+            expandSchedule(&blockWords, firstWord: 16)
+            var blkWorking = state
+            sha256Rounds(state: &blkWorking, words: blockWords, firstRound: 0)
+            for i in 0..<8 {
+                state[i] = (state[i] &+ blkWorking[i]) & u32Mask
+            }
+            offset += 64
+        }
+
+        var digestBytes = [UInt8](repeating: 0, count: 32)
+        for i in 0..<8 {
+            let word = state[i]
+            digestBytes[i * 4 + 0] = UInt8((word >> 24) & 0xFF)
+            digestBytes[i * 4 + 1] = UInt8((word >> 16) & 0xFF)
+            digestBytes[i * 4 + 2] = UInt8((word >> 8) & 0xFF)
+            digestBytes[i * 4 + 3] = UInt8(word & 0xFF)
+        }
+
+        // 3. _cs64_digest(data, digest)
+        var keyA = UInt64(digestBytes[0]) | (UInt64(digestBytes[1]) << 8) | (UInt64(digestBytes[2]) << 16) | (UInt64(digestBytes[3]) << 24)
+        var keyB = UInt64(digestBytes[4]) | (UInt64(digestBytes[5]) << 8) | (UInt64(digestBytes[6]) << 16) | (UInt64(digestBytes[7]) << 24)
+        keyA |= 1
+        keyB |= 1
+
+        let factor0 = (keyA &* 0x82893933) & u32Mask
+        let factor1 = (keyB &* 0x82893933) & u32Mask
+
+        var terms = [UInt64]()
+        var offsets = [UInt64]()
+        for i in 0..<14 {
+            let f = (i % 2 == 0) ? factor0 : factor1
+            terms.append((cs64CoeffA[i] &* f) & u32Mask)
+            offsets.append(cs64CoeffB[i])
+        }
+
+        var prefixed = [UInt8]()
+        prefixed.append(0x00)
+        prefixed.append(contentsOf: dataBytes)
+        while prefixed.count % 4 != 0 {
+            prefixed.append(0x00)
+        }
+
+        var leWords = [UInt64]()
+        var pIdx = 0
+        while pIdx < prefixed.count {
+            let w = UInt64(prefixed[pIdx]) | (UInt64(prefixed[pIdx + 1]) << 8) | (UInt64(prefixed[pIdx + 2]) << 16) | (UInt64(prefixed[pIdx + 3]) << 24)
+            leWords.append(w)
+            pIdx += 4
+        }
+        if leWords.count % 2 == 1 {
+            leWords.append(0)
+        }
+
+        for (idx, word) in leWords.enumerated() {
+            let k = (idx % 2 == 0) ? keyA : keyB
+            let c: UInt64 = (idx % 2 == 0) ? 0xEF0569FB : 0xC31713DB
+            var term = word &* k
+            var off = rol16(word) &* c
+            if idx == 0 {
+                term = term &+ (0xF2F90B1A &* factor0)
+                off = off &+ 0x0B1A0000
+            }
+            terms.append(term & u32Mask)
+            offsets.append(off & u32Mask)
+        }
+
+        var swapAcc: UInt64 = 0
+        var swapLast: UInt64 = 0
+        var st: UInt64 = 0
+        var acc: UInt64 = 0
+
+        var tIdx = 0
+        while tIdx < terms.count {
+            let x = terms[tIdx]
+            let y = terms[tIdx + 1]
+
+            let t0 = rol16((offsets[tIdx] &+ x) & u32Mask)
+            let q0 = (t0 &* 0x76F50F34) & u32Mask
+            swapAcc = swapAcc &+ ((rol16(q0) &* 0xC3EFEA97 &+ q0) & u32Mask)
+
+            let t1 = rol16((offsets[tIdx + 1] &+ y) & u32Mask)
+            let q1 = (t1 &* 0x1881CE3C) & u32Mask
+            swapLast = (rol16(q1) &* 0x35BD1EC9 &+ q1) & u32Mask
+            swapAcc = (swapAcc &+ swapLast) & u32Mask
+
+            st = (st &* keyA &+ x) & u32Mask
+            st = (rol16(st) &* 0xCF98B111) & u32Mask
+            st = (rol16(st) &* 0x87085B9F) & u32Mask
+            st = (rol16(st) &* 0x12CEB96D) & u32Mask
+            st = (rol16(st) &* 0x257E1D83) & u32Mask
+            acc = acc &+ st
+
+            var tm = (st &* keyB &+ y) & u32Mask
+            tm = (rol16(tm) &* 0xA27416F5) & u32Mask
+            tm = (rol16(tm) &* 0xD38396FF) & u32Mask
+            let inner = (rol16(tm) &* 0x7C932B89) & u32Mask
+            st = (rol16(inner) &* 0xBFA49F69) & u32Mask
+            acc = (acc &+ st) & u32Mask
+
+            tIdx += 2
+        }
+
+        let cs0 = (swapLast ^ st) & u32Mask
+        let cs1 = (swapAcc ^ acc) & u32Mask
+        let csBytes: [UInt8] = [
+            UInt8(cs0 & 0xFF), UInt8((cs0 >> 8) & 0xFF), UInt8((cs0 >> 16) & 0xFF), UInt8((cs0 >> 24) & 0xFF),
+            UInt8(cs1 & 0xFF), UInt8((cs1 >> 8) & 0xFF), UInt8((cs1 >> 16) & 0xFF), UInt8((cs1 >> 24) & 0xFF)
+        ]
+
+        var csHex = ""
+        for b in csBytes {
+            csHex += String(format: "%02X", b)
+        }
+        var shaHex = ""
+        for b in digestBytes {
+            shaHex += String(format: "%02X", b)
+        }
+        return "\(csHex)-\(shaHex)"
     }
 
     private static func formatEdgeTimestamp(from timestamp: TimeInterval) -> String {
