@@ -5,6 +5,8 @@ import CryptoKit
 import Combine
 
 enum StoryVoiceChoice: String, CaseIterable, Identifiable, Codable {
+    case geminiKore = "gemini-kore"
+    case geminiPuck = "gemini-puck"
     case namMinh = "vi-VN-NamMinhNeural"
     case hoaiMy = "vi-VN-HoaiMyNeural"
     case googleVi = "google-vi"
@@ -13,6 +15,8 @@ enum StoryVoiceChoice: String, CaseIterable, Identifiable, Codable {
 
     var displayName: String {
         switch self {
+        case .geminiKore: return "Gemini AI Nữ (Truyền cảm)"
+        case .geminiPuck: return "Gemini AI Nam (Trầm ấm)"
         case .namMinh: return "Nam Minh (AI Trầm ấm)"
         case .hoaiMy: return "Hoài My (AI Truyền cảm)"
         case .googleVi: return "Google Tiếng Việt (AI)"
@@ -21,9 +25,29 @@ enum StoryVoiceChoice: String, CaseIterable, Identifiable, Codable {
 
     var shortName: String {
         switch self {
+        case .geminiKore: return "Gemini Nữ"
+        case .geminiPuck: return "Gemini Nam"
         case .namMinh: return "Nam Minh AI"
         case .hoaiMy: return "Hoài My AI"
         case .googleVi: return "Google AI"
+        }
+    }
+
+    var geminiVoiceName: String {
+        switch self {
+        case .geminiPuck, .namMinh:
+            return "Puck"
+        case .geminiKore, .hoaiMy, .googleVi:
+            return "Kore"
+        }
+    }
+
+    var edgeVoiceName: String {
+        switch self {
+        case .geminiPuck, .namMinh:
+            return "vi-VN-NamMinhNeural"
+        case .geminiKore, .hoaiMy, .googleVi:
+            return "vi-VN-HoaiMyNeural"
         }
     }
 }
@@ -40,7 +64,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     @Published var currentChapterTitle: String = ""
     @Published var activeVoiceLabel: String = ""
 
-    @Published var selectedVoiceChoice: StoryVoiceChoice = .namMinh {
+    @Published var selectedVoiceChoice: StoryVoiceChoice = .geminiKore {
         didSet {
             UserDefaults.standard.set(selectedVoiceChoice.rawValue, forKey: "DOC_TRUYEN_SPEECH_VOICE_CHOICE")
             if isSpeaking {
@@ -72,6 +96,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     private var prefetchTasks: [Int: Task<Data?, Never>] = [:]
     private var playSessionToken: UUID = UUID()
     private var consecutiveFailures: Int = 0
+    private var tempFileToggle: Int = 0
 
     private override init() {
         super.init()
@@ -84,8 +109,8 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
            let voice = StoryVoiceChoice(rawValue: savedVoiceRaw) {
             selectedVoiceChoice = voice
         } else {
-            selectedVoiceChoice = .namMinh
-            UserDefaults.standard.set(StoryVoiceChoice.namMinh.rawValue, forKey: "DOC_TRUYEN_SPEECH_VOICE_CHOICE")
+            selectedVoiceChoice = .geminiKore
+            UserDefaults.standard.set(StoryVoiceChoice.geminiKore.rawValue, forKey: "DOC_TRUYEN_SPEECH_VOICE_CHOICE")
         }
 
         setupRemoteCommands()
@@ -201,7 +226,6 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     func resolveChunkIndex(forScrollRatio ratio: Double) -> Int {
         guard !chunks.isEmpty else { return 0 }
         let clamped = min(1.0, max(0.0, ratio))
-        // Nếu người dùng đang ở đầu chương (chưa cuộn xuống đáng kể) -> đọc từ đầu (chunk 0)
         if clamped <= 0.015 {
             return 0
         }
@@ -316,7 +340,12 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         }
     }
 
-    // MARK: - Phát từng đoạn (100% Giọng đọc AI trực tuyến, tuyệt đối không dùng giọng ngoại tuyến)
+    private static var currentSavedGeminiApiKey: String {
+        (UserDefaults.standard.string(forKey: "DOC_TRUYEN_GEMINI_API_KEY") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - Phát từng đoạn (Kết hợp Gemini AI TTS -> Edge Neural AI -> Google AI, không dùng giọng ngoại tuyến)
     private func playCurrentChunk() {
         let sessionToken = playSessionToken
         guard currentChunkIndex >= 0, currentChunkIndex < chunks.count else {
@@ -355,13 +384,14 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     self.playCurrentChunk()
                 } else {
                     self.stopInternal(resetTitle: false)
-                    self.onError?("Không thể kết nối giọng đọc AI. Vui lòng kiểm tra kết nối mạng.")
+                    self.onError?("Không thể tải âm thanh giọng đọc AI. Vui lòng kiểm tra kết nối mạng hoặc Gemini API Key.")
                 }
             }
         }
     }
 
     private func prefetchUpcomingChunks(after index: Int, voice: StoryVoiceChoice, sessionToken: UUID) {
+        let apiKey = Self.currentSavedGeminiApiKey
         for offset in 1...2 {
             let targetIdx = index + offset
             guard targetIdx < chunks.count else { break }
@@ -369,7 +399,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
             let targetText = chunks[targetIdx]
             let task = Task<Data?, Never> {
-                let data = await Self.synthesizeSpeechData(text: targetText, voice: voice)
+                let data = await Self.synthesizeSpeechData(text: targetText, voice: voice, geminiApiKey: apiKey)
                 if !Task.isCancelled, self.playSessionToken == sessionToken, let data {
                     self.prefetchedAudioCache[targetIdx] = data
                 }
@@ -390,82 +420,138 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 return data
             }
         }
-        return await Self.synthesizeSpeechData(text: text, voice: voice)
+        let apiKey = Self.currentSavedGeminiApiKey
+        return await Self.synthesizeSpeechData(text: text, voice: voice, geminiApiKey: apiKey)
     }
 
-    private static func synthesizeSpeechData(text: String, voice: StoryVoiceChoice) async -> Data? {
+    private static func synthesizeSpeechData(
+        text: String,
+        voice: StoryVoiceChoice,
+        geminiApiKey: String
+    ) async -> Data? {
         let cleaned = sanitizeLineForSpeech(text)
         guard !cleaned.isEmpty else { return nil }
 
-        if voice == .namMinh || voice == .hoaiMy {
-            if let edgeData = await EdgeNeuralTTSClient.synthesize(text: cleaned, voiceName: voice.rawValue),
+        switch voice {
+        case .geminiKore, .geminiPuck:
+            // 1. Ưu tiên gọi trực tiếp Gemini 2.5 Flash TTS bằng API Key người dùng đã nhập
+            if !geminiApiKey.isEmpty {
+                if let geminiAudio = await GeminiTTSClient.synthesize(
+                    text: cleaned,
+                    voiceName: voice.geminiVoiceName,
+                    apiKey: geminiApiKey
+                ), geminiAudio.count > 200 {
+                    return geminiAudio
+                }
+            }
+            // 2. Dự phòng tức thì sang Edge Neural AI cùng giới tính giọng
+            if let edgeData = await EdgeNeuralTTSClient.synthesize(text: cleaned, voiceName: voice.edgeVoiceName),
+               edgeData.count > 200 {
+                return edgeData
+            }
+            // 3. Dự phòng cuối sang Google Cloud / Translate TTS
+            if let googleData = await GoogleTranslateTTSClient.synthesize(text: cleaned),
+               googleData.count > 200 {
+                return googleData
+            }
+
+        case .namMinh, .hoaiMy:
+            // 1. Ưu tiên Edge Neural AI (Nam Minh / Hoài My)
+            if let edgeData = await EdgeNeuralTTSClient.synthesize(text: cleaned, voiceName: voice.edgeVoiceName),
+               edgeData.count > 200 {
+                return edgeData
+            }
+            // 2. Nếu mạng chặn WebSocket Edge -> Gọi Gemini AI TTS
+            if !geminiApiKey.isEmpty {
+                if let geminiAudio = await GeminiTTSClient.synthesize(
+                    text: cleaned,
+                    voiceName: voice.geminiVoiceName,
+                    apiKey: geminiApiKey
+                ), geminiAudio.count > 200 {
+                    return geminiAudio
+                }
+            }
+            // 3. Dự phòng sang Google Cloud / Translate TTS
+            if let googleData = await GoogleTranslateTTSClient.synthesize(text: cleaned),
+               googleData.count > 200 {
+                return googleData
+            }
+
+        case .googleVi:
+            if let googleData = await GoogleTranslateTTSClient.synthesize(text: cleaned),
+               googleData.count > 200 {
+                return googleData
+            }
+            if !geminiApiKey.isEmpty {
+                if let geminiAudio = await GeminiTTSClient.synthesize(
+                    text: cleaned,
+                    voiceName: "Kore",
+                    apiKey: geminiApiKey
+                ), geminiAudio.count > 200 {
+                    return geminiAudio
+                }
+            }
+            if let edgeData = await EdgeNeuralTTSClient.synthesize(text: cleaned, voiceName: "vi-VN-HoaiMyNeural"),
                edgeData.count > 200 {
                 return edgeData
             }
         }
-        if let googleData = await GoogleTranslateTTSClient.synthesize(text: cleaned),
-           googleData.count > 200 {
-            return googleData
-        }
-        if voice == .googleVi {
-            if let edgeFallback = await EdgeNeuralTTSClient.synthesize(text: cleaned, voiceName: StoryVoiceChoice.namMinh.rawValue),
-               edgeFallback.count > 200 {
-                return edgeFallback
-            }
-        }
+
         return nil
     }
 
     @discardableResult
     private func playAudioData(_ data: Data, voiceLabel: String) -> Bool {
+        guard data.count > 200 else { return false }
         audioPlayer?.stop()
         audioPlayer = nil
+        configureAudioSession()
 
-        if let player = try? AVAudioPlayer(data: data, fileTypeHint: AVFileType.mp3.rawValue) {
-            player.delegate = self
-            player.enableRate = true
-            player.rate = Float(min(2.0, max(0.6, playbackSpeedMultiplier)))
-            player.prepareToPlay()
-            if player.play() {
-                audioPlayer = player
+        let isWAV = Self.isRIFFWaveData(data)
+        let hint = isWAV ? AVFileType.wav.rawValue : AVFileType.mp3.rawValue
+        let ext = isWAV ? "wav" : "mp3"
+        let targetRate = Float(min(2.0, max(0.6, playbackSpeedMultiplier)))
+
+        // Ưu tiên ghi ra file tạm luân phiên (.wav / .mp3) để AVAudioPlayer trên iOS đọc header chính xác 100%
+        tempFileToggle = (tempFileToggle + 1) % 2
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("doctruyen_tts_slot_\(tempFileToggle).\(ext)")
+
+        if let _ = try? data.write(to: tempURL, options: .atomic),
+           let filePlayer = try? AVAudioPlayer(contentsOf: tempURL) {
+            filePlayer.delegate = self
+            filePlayer.enableRate = true
+            filePlayer.prepareToPlay()
+            filePlayer.rate = targetRate
+            if filePlayer.play() {
+                audioPlayer = filePlayer
                 activeVoiceLabel = voiceLabel
                 updateNowPlayingInfo()
                 return true
             }
         }
 
-        if let player = try? AVAudioPlayer(data: data) {
-            player.delegate = self
-            player.enableRate = true
-            player.rate = Float(min(2.0, max(0.6, playbackSpeedMultiplier)))
-            player.prepareToPlay()
-            if player.play() {
-                audioPlayer = player
+        if let memPlayer = try? AVAudioPlayer(data: data, fileTypeHint: hint) {
+            memPlayer.delegate = self
+            memPlayer.enableRate = true
+            memPlayer.prepareToPlay()
+            memPlayer.rate = targetRate
+            if memPlayer.play() {
+                audioPlayer = memPlayer
                 activeVoiceLabel = voiceLabel
                 updateNowPlayingInfo()
                 return true
             }
         }
 
-        // Fallback ghi ra file tạm .mp3 cho các luồng MPEG raw không có ID3 header
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("doctruyen_tts_chunk.mp3")
-        do {
-            try data.write(to: tempURL, options: .atomic)
-            let player = try AVAudioPlayer(contentsOf: tempURL)
-            player.delegate = self
-            player.enableRate = true
-            player.rate = Float(min(2.0, max(0.6, playbackSpeedMultiplier)))
-            player.prepareToPlay()
-            if player.play() {
-                audioPlayer = player
-                activeVoiceLabel = voiceLabel
-                updateNowPlayingInfo()
-                return true
-            }
-        } catch {
-            return false
-        }
         return false
+    }
+
+    private static func isRIFFWaveData(_ data: Data) -> Bool {
+        guard data.count >= 12 else { return false }
+        let riff = String(data: data.subdata(in: 0..<4), encoding: .ascii)
+        let wave = String(data: data.subdata(in: 8..<12), encoding: .ascii)
+        return riff == "RIFF" && wave == "WAVE"
     }
 
     private func advanceToNextChunkOrChapter() {
@@ -495,12 +581,10 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         var s = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else { return "" }
 
-        // 1. Bỏ tiêu đề markdown đầu dòng (### ...)
         if let r = s.range(of: #"^#{1,6}\s*"#, options: .regularExpression) {
             s.removeSubrange(r)
         }
 
-        // 2. Loại bỏ toàn bộ dấu ngoặc kép, ngoặc truyện và các ký tự trang trí để app không đọc tên ký tự
         let forbiddenLiterals = [
             "\"", "“", "”", "„", "‟", "«", "»", "‹", "›",
             "‘", "’", "`", "´",
@@ -512,16 +596,13 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             s = s.replacingOccurrences(of: token, with: " ")
         }
 
-        // 3. Nếu cả dòng chỉ là dòng kẻ phân cách (===, ---, ***, ___, ~~~, ===o0o===, ...)
         if s.range(of: #"^[\s=\-\*_~•·\.…o0O\+<>\|/]+$"#, options: .regularExpression) != nil {
             return ""
         }
 
-        // 4. Thay dấu ba chấm (..., …) và gạch ngang dài (---, —, –) bằng dấu phẩy ngắt nhịp tự nhiên
         s = s.replacingOccurrences(of: #"(\.{2,}|…+)"#, with: ", ", options: .regularExpression)
         s = s.replacingOccurrences(of: #"(\-{2,}|—+|–+)"#, with: ", ", options: .regularExpression)
 
-        // 5. Dọn các dấu câu bị lặp hoặc đứng đầu/cuối câu
         s = s.replacingOccurrences(of: #"(\s*,\s*){2,}"#, with: ", ", options: .regularExpression)
         s = s.replacingOccurrences(of: #"[,\s]+([.!?])"#, with: "$1", options: .regularExpression)
         s = s.replacingOccurrences(of: #"([.!?])\s*,+"#, with: "$1", options: .regularExpression)
@@ -530,7 +611,6 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         s = s.replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
         s = s.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // 6. Chỉ giữ lại nếu có ít nhất 1 chữ cái hoặc chữ số
         guard s.rangeOfCharacter(from: .alphanumerics) != nil else {
             return ""
         }
@@ -544,7 +624,6 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         let rawLines = rawText.components(separatedBy: .newlines)
         let charsPerVisualLine: Double = 38.0
 
-        // Tính tổng số dòng hiển thị ước lượng (bao gồm cả dòng trống giống hệt Text trong ScrollView)
         var lineVisualStarts: [Double] = []
         var cumulativeVisualLines: Double = 0.0
 
@@ -591,7 +670,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             }
         }
 
-        let maxChunkLen = 180
+        let maxChunkLen = 220
 
         for (lineIdx, rawLine) in rawLines.enumerated() {
             let linecleaned = Self.sanitizeLineForSpeech(rawLine)
@@ -672,10 +751,206 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 }
 
-// MARK: - Microsoft Edge Neural TTS WebSocket Client (Đã sửa lỗi tràn số thực Sec-MS-GEC & đồng bộ giờ Server)
+// MARK: - Gemini 2.5 Flash Native Audio TTS Client (Bọc chuẩn RIFF/WAV 24kHz 16-bit PCM cho AVAudioPlayer)
+private enum GeminiTTSClient {
+    private static let stateLock = NSLock()
+    private static var quotaCooldownUntil: TimeInterval = 0
+
+    private static let candidateTTSModels = [
+        "gemini-2.5-flash-preview-tts",
+        "gemini-2.5-flash-tts"
+    ]
+
+    private static func isInQuotaCooldown() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return Date().timeIntervalSince1970 < quotaCooldownUntil
+    }
+
+    private static func markQuotaCooldown(seconds: TimeInterval) {
+        stateLock.lock()
+        quotaCooldownUntil = Date().timeIntervalSince1970 + seconds
+        stateLock.unlock()
+    }
+
+    static func synthesize(text: String, voiceName: String, apiKey: String) async -> Data? {
+        let cleanKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanKey.isEmpty, !trimmed.isEmpty, !isInQuotaCooldown() else {
+            return nil
+        }
+
+        for model in candidateTTSModels {
+            let result = await callGeminiAudioEndpoint(
+                model: model,
+                text: trimmed,
+                voiceName: voiceName,
+                apiKey: cleanKey
+            )
+            switch result {
+            case .success(let wavData):
+                return wavData
+            case .rateLimited:
+                // Tạm chuyển sang Edge Neural / Google trong 20s để không bị ngắt quãng khi chạm RPM
+                markQuotaCooldown(seconds: 20)
+                return nil
+            case .tryNextModel:
+                continue
+            }
+        }
+        return nil
+    }
+
+    private enum CallResult {
+        case success(Data)
+        case rateLimited
+        case tryNextModel
+    }
+
+    private static func callGeminiAudioEndpoint(
+        model: String,
+        text: String,
+        voiceName: String,
+        apiKey: String
+    ) async -> CallResult {
+        let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)"
+        guard let url = URL(string: urlString) else { return .tryNextModel }
+
+        let requestBody: [String: Any] = [
+            "contents": [
+                [
+                    "parts": [
+                        ["text": "Đọc diễn cảm tiếng Việt đoạn văn sau: \(text)"]
+                    ]
+                ]
+            ],
+            "generationConfig": [
+                "responseModalities": ["AUDIO"],
+                "speechConfig": [
+                    "voiceConfig": [
+                        "prebuiltVoiceConfig": [
+                            "voiceName": voiceName
+                        ]
+                    ]
+                ]
+            ]
+        ]
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 10
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: requestBody) else {
+            return .tryNextModel
+        }
+        request.httpBody = bodyData
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 500
+            if statusCode == 429 || statusCode == 503 {
+                return .rateLimited
+            }
+            guard (200...299).contains(statusCode) else {
+                return .tryNextModel
+            }
+
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let candidates = json["candidates"] as? [[String: Any]],
+                  let firstCandidate = candidates.first,
+                  let content = firstCandidate["content"] as? [String: Any],
+                  let parts = content["parts"] as? [[String: Any]] else {
+                return .tryNextModel
+            }
+
+            for part in parts {
+                if let inlineData = part["inlineData"] as? [String: Any],
+                   let b64 = inlineData["data"] as? String,
+                   let rawAudio = Data(base64Encoded: b64, options: .ignoreUnknownCharacters),
+                   rawAudio.count > 200 {
+                    let mime = ((inlineData["mimeType"] as? String) ?? "").lowercased()
+                    if mime.contains("wav") || isAlreadyContainerized(rawAudio) {
+                        return .success(rawAudio)
+                    } else {
+                        let sampleRate = extractSampleRate(from: mime) ?? 24000
+                        let wavData = wrapRawPCMInWAVHeader(
+                            pcmData: rawAudio,
+                            sampleRate: UInt32(sampleRate),
+                            channels: 1,
+                            bitsPerSample: 16
+                        )
+                        return .success(wavData)
+                    }
+                }
+            }
+            return .tryNextModel
+        } catch {
+            return .tryNextModel
+        }
+    }
+
+    private static func extractSampleRate(from mimeType: String) -> Int? {
+        guard let range = mimeType.range(of: #"rate=\d+"#, options: .regularExpression) else {
+            return nil
+        }
+        let sub = mimeType[range].replacingOccurrences(of: "rate=", with: "")
+        return Int(sub)
+    }
+
+    private static func isAlreadyContainerized(_ data: Data) -> Bool {
+        guard data.count >= 4 else { return false }
+        let magic = String(data: data.subdata(in: 0..<4), encoding: .ascii) ?? ""
+        if magic == "RIFF" || magic.hasPrefix("ID3") {
+            return true
+        }
+        return false
+    }
+
+    /// Đóng gói dữ liệu PCM 16-bit signed little-endian nguyên bản của Gemini thành file WAV chuẩn RIFF (44-byte header)
+    static func wrapRawPCMInWAVHeader(
+        pcmData: Data,
+        sampleRate: UInt32 = 24000,
+        channels: UInt16 = 1,
+        bitsPerSample: UInt16 = 16
+    ) -> Data {
+        let byteRate = sampleRate * UInt32(channels) * UInt32(bitsPerSample / 8)
+        let blockAlign = channels * (bitsPerSample / 8)
+        let dataSize = UInt32(pcmData.count)
+        let chunkSize = UInt32(36) + dataSize
+
+        var header = Data(capacity: 44 + pcmData.count)
+        header.append(contentsOf: [0x52, 0x49, 0x46, 0x46]) // "RIFF"
+        header.append(uint32LE(chunkSize))
+        header.append(contentsOf: [0x57, 0x41, 0x56, 0x45]) // "WAVE"
+        header.append(contentsOf: [0x66, 0x6D, 0x74, 0x20]) // "fmt "
+        header.append(uint32LE(16))                         // Subchunk1Size (16 for PCM)
+        header.append(uint16LE(1))                          // AudioFormat (1 = PCM)
+        header.append(uint16LE(channels))
+        header.append(uint32LE(sampleRate))
+        header.append(uint32LE(byteRate))
+        header.append(uint16LE(blockAlign))
+        header.append(uint16LE(bitsPerSample))
+        header.append(contentsOf: [0x64, 0x61, 0x74, 0x61]) // "data"
+        header.append(uint32LE(dataSize))
+        header.append(pcmData)
+        return header
+    }
+
+    private static func uint32LE(_ value: UInt32) -> Data {
+        var le = value.littleEndian
+        return Data(bytes: &le, count: 4)
+    }
+
+    private static func uint16LE(_ value: UInt16) -> Data {
+        var le = value.littleEndian
+        return Data(bytes: &le, count: 2)
+    }
+}
+
+// MARK: - Microsoft Edge Neural TTS WebSocket Client (Có Cookie MUID + withTaskCancellationHandler chống treo)
 private enum EdgeNeuralTTSClient {
     private static let trustedToken = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
-    private static let secMsGecVersion = "1-132.0.2957.140"
+    private static let secMsGecVersion = "1-130.0.2849.68"
     private static let clockLock = NSLock()
     private static var serverTimeOffsetSeconds: TimeInterval = 0
     private static var hasSyncedServerClock: Bool = false
@@ -688,13 +963,7 @@ private enum EdgeNeuralTTSClient {
             await syncServerClock()
         }
 
-        if let data = await attemptSynthesizeWithTimeout(text: trimmed, voiceName: voiceName, timeoutSeconds: 6.5) {
-            return data
-        }
-
-        // Nếu lần 1 lỗi (có thể do lệch đồng hồ), ép đồng bộ lại giờ thực từ máy chủ rồi thử lại 1 lần
-        await syncServerClock()
-        return await attemptSynthesizeWithTimeout(text: trimmed, voiceName: voiceName, timeoutSeconds: 6.5)
+        return await attemptSynthesizeWithTimeout(text: trimmed, voiceName: voiceName, timeoutSeconds: 4.0)
     }
 
     private static func isClockSynced() -> Bool {
@@ -731,7 +1000,7 @@ private enum EdgeNeuralTTSClient {
             guard let url = URL(string: urlStr) else { continue }
             var req = URLRequest(url: url)
             req.httpMethod = "HEAD"
-            req.timeoutInterval = 4
+            req.timeoutInterval = 3
             do {
                 let (_, resp) = try await URLSession.shared.data(for: req)
                 if let http = resp as? HTTPURLResponse,
@@ -773,75 +1042,81 @@ private enum EdgeNeuralTTSClient {
         let urlString = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=\(trustedToken)&Sec-MS-GEC=\(secMsGec)&Sec-MS-GEC-Version=\(secMsGecVersion)&ConnectionId=\(connectionId)"
         guard let url = URL(string: urlString) else { return nil }
 
+        let muid = (0..<32).map { _ in String(format: "%X", Int.random(in: 0...15)) }.joined()
         var request = URLRequest(url: url)
-        request.timeoutInterval = 8
+        request.timeoutInterval = 4
         request.setValue("chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold", forHTTPHeaderField: "Origin")
-        request.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("MUID=\(muid);", forHTTPHeaderField: "Cookie")
         request.setValue("no-cache", forHTTPHeaderField: "Pragma")
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
 
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 8
-        config.timeoutIntervalForResource = 10
+        config.timeoutIntervalForRequest = 4
+        config.timeoutIntervalForResource = 5
         let session = URLSession(configuration: config)
         let ws = session.webSocketTask(with: request)
         ws.resume()
 
-        defer {
+        return await withTaskCancellationHandler {
+            defer {
+                ws.cancel(with: .goingAway, reason: nil)
+                session.invalidateAndCancel()
+            }
+
+            let timestamp = formatEdgeTimestamp(from: nowTimestamp)
+            let configPayload = "X-Timestamp:\(timestamp)\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}\r\n"
+
+            let escapedText = text
+                .replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+                .replacingOccurrences(of: "\"", with: "&quot;")
+                .replacingOccurrences(of: "'", with: "&apos;")
+
+            let reqId = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+            let ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='vi-VN'><voice name='\(voiceName)'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>\(escapedText)</prosody></voice></speak>"
+            let ssmlPayload = "X-RequestId:\(reqId)\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:\(timestamp)Z\r\nPath:ssml\r\n\r\n\(ssml)"
+
+            do {
+                try await ws.send(.string(configPayload))
+                try await ws.send(.string(ssmlPayload))
+
+                var audioBuffer = Data()
+                while !Task.isCancelled {
+                    let message = try await ws.receive()
+                    switch message {
+                    case .string(let str):
+                        if str.contains("Path:turn.end") {
+                            return audioBuffer.isEmpty ? nil : audioBuffer
+                        }
+                    case .data(let data):
+                        if data.count >= 2 {
+                            let headerLen = (Int(data[0]) << 8) | Int(data[1])
+                            let payloadStart = 2 + headerLen
+                            if payloadStart < data.count {
+                                let headerData = data.subdata(in: 2..<payloadStart)
+                                if let headerStr = String(data: headerData, encoding: .utf8),
+                                   headerStr.contains("Path:audio") {
+                                    audioBuffer.append(data.subdata(in: payloadStart..<data.count))
+                                }
+                            }
+                        }
+                    @unknown default:
+                        break
+                    }
+                }
+                return nil
+            } catch {
+                return nil
+            }
+        } onCancel: {
             ws.cancel(with: .goingAway, reason: nil)
             session.invalidateAndCancel()
         }
-
-        let timestamp = formatEdgeTimestamp(from: nowTimestamp)
-        let configPayload = "X-Timestamp:\(timestamp)\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}"
-
-        let escapedText = text
-            .replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
-            .replacingOccurrences(of: "\"", with: "&quot;")
-            .replacingOccurrences(of: "'", with: "&apos;")
-
-        let reqId = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        let ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='vi-VN'><voice name='\(voiceName)'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>\(escapedText)</prosody></voice></speak>"
-        let ssmlPayload = "X-RequestId:\(reqId)\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:\(timestamp)\r\nPath:ssml\r\n\r\n\(ssml)"
-
-        do {
-            try await ws.send(.string(configPayload))
-            try await ws.send(.string(ssmlPayload))
-
-            var audioBuffer = Data()
-            while !Task.isCancelled {
-                let message = try await ws.receive()
-                switch message {
-                case .string(let str):
-                    if str.contains("Path:turn.end") {
-                        return audioBuffer.isEmpty ? nil : audioBuffer
-                    }
-                case .data(let data):
-                    if data.count >= 2 {
-                        let headerLen = (Int(data[0]) << 8) | Int(data[1])
-                        let payloadStart = 2 + headerLen
-                        if payloadStart < data.count {
-                            let headerData = data.subdata(in: 2..<payloadStart)
-                            if let headerStr = String(data: headerData, encoding: .utf8),
-                               headerStr.contains("Path:audio") {
-                                audioBuffer.append(data.subdata(in: payloadStart..<data.count))
-                            }
-                        }
-                    }
-                @unknown default:
-                    break
-                }
-            }
-            return nil
-        } catch {
-            return nil
-        }
     }
 
-    /// Tính toán Sec-MS-GEC bằng số nguyên Int64 chính xác tuyệt đối (không bị sai số dấu phẩy động Double)
     private static func generateSecMsGec(timestamp: TimeInterval) -> String {
         let winEpochOffset: Int64 = 11_644_473_600
         let unixSeconds = Int64(timestamp)
@@ -863,13 +1138,13 @@ private enum EdgeNeuralTTSClient {
     }
 }
 
-// MARK: - Google Cloud / Translate TTS Multi-Endpoint Client
+// MARK: - Google Cloud / Translate TTS Multi-Endpoint Client (Dùng URLComponents chuẩn xác 100%)
 private enum GoogleTranslateTTSClient {
     static func synthesize(text: String) async -> Data? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
-        let subSegments = splitForGoogleLimit(trimmed, maxLen: 165)
+        let subSegments = splitForGoogleLimit(trimmed, maxLen: 150)
         var combinedAudio = Data()
 
         for segment in subSegments {
@@ -883,21 +1158,53 @@ private enum GoogleTranslateTTSClient {
         return combinedAudio.count > 200 ? combinedAudio : nil
     }
 
+    private static func buildCandidateURLs(for segment: String) -> [URL] {
+        var urls: [URL] = []
+
+        if var c1 = URLComponents(string: "https://translate.googleapis.com/translate_tts") {
+            c1.queryItems = [
+                URLQueryItem(name: "client", value: "gtx"),
+                URLQueryItem(name: "ie", value: "UTF-8"),
+                URLQueryItem(name: "tl", value: "vi"),
+                URLQueryItem(name: "dt", value: "t"),
+                URLQueryItem(name: "q", value: segment)
+            ]
+            if let u = c1.url { urls.append(u) }
+        }
+
+        if var c2 = URLComponents(string: "https://translate.google.com/translate_tts") {
+            c2.queryItems = [
+                URLQueryItem(name: "ie", value: "UTF-8"),
+                URLQueryItem(name: "tl", value: "vi"),
+                URLQueryItem(name: "client", value: "tw-ob"),
+                URLQueryItem(name: "ttsspeed", value: "1"),
+                URLQueryItem(name: "total", value: "1"),
+                URLQueryItem(name: "idx", value: "0"),
+                URLQueryItem(name: "textlen", value: "\(segment.count)"),
+                URLQueryItem(name: "q", value: segment)
+            ]
+            if let u = c2.url { urls.append(u) }
+        }
+
+        if var c3 = URLComponents(string: "https://clients5.google.com/translate_tts") {
+            c3.queryItems = [
+                URLQueryItem(name: "ie", value: "UTF-8"),
+                URLQueryItem(name: "tl", value: "vi"),
+                URLQueryItem(name: "client", value: "dict-chrome-ex"),
+                URLQueryItem(name: "q", value: segment)
+            ]
+            if let u = c3.url { urls.append(u) }
+        }
+
+        return urls
+    }
+
     private static func fetchSingleSegmentAudio(_ segment: String) async -> Data? {
-        let encoded = segment.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        guard !encoded.isEmpty else { return nil }
+        let candidateUrls = buildCandidateURLs(for: segment)
 
-        let candidateUrls = [
-            "https://translate.googleapis.com/translate_tts?client=gtx&ie=UTF-8&tl=vi&dt=t&q=\(encoded)",
-            "https://translate.google.com/translate_tts?ie=UTF-8&tl=vi&client=dict-chrome-ex&ttsspeed=1&q=\(encoded)",
-            "https://clients5.google.com/translate_tts?ie=UTF-8&tl=vi&client=dict-chrome-ex&q=\(encoded)",
-            "https://translate.google.com/translate_tts?ie=UTF-8&tl=vi&client=tw-ob&q=\(encoded)"
-        ]
-
-        for urlStr in candidateUrls {
-            guard let url = URL(string: urlStr) else { continue }
+        for url in candidateUrls {
             var request = URLRequest(url: url)
-            request.timeoutInterval = 7
+            request.timeoutInterval = 6
             request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
             request.setValue("https://translate.google.com/", forHTTPHeaderField: "Referer")
 
