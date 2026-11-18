@@ -500,12 +500,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             s.removeSubrange(r)
         }
 
-        // 2. Nếu cả dòng chỉ là dòng kẻ phân cách (===, ---, ***, ___, ~~~, ===o0o===, ...)
-        if s.range(of: #"^[\s=\-\*_~•·\.…o0O\+<>\|/\\#]+$"#, options: .regularExpression) != nil {
-            return ""
-        }
-
-        // 3. Loại bỏ toàn bộ dấu ngoặc kép, ngoặc truyện và các ký tự trang trí để app không đọc tên ký tự
+        // 2. Loại bỏ toàn bộ dấu ngoặc kép, ngoặc truyện và các ký tự trang trí để app không đọc tên ký tự
         let forbiddenLiterals = [
             "\"", "“", "”", "„", "‟", "«", "»", "‹", "›",
             "‘", "’", "`", "´",
@@ -515,6 +510,11 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         ]
         for token in forbiddenLiterals {
             s = s.replacingOccurrences(of: token, with: " ")
+        }
+
+        // 3. Nếu cả dòng chỉ là dòng kẻ phân cách (===, ---, ***, ___, ~~~, ===o0o===, ...)
+        if s.range(of: #"^[\s=\-\*_~•·\.…o0O\+<>\|/]+$"#, options: .regularExpression) != nil {
+            return ""
         }
 
         // 4. Thay dấu ba chấm (..., …) và gạch ngang dài (---, —, –) bằng dấu phẩy ngắt nhịp tự nhiên
@@ -703,6 +703,13 @@ private enum EdgeNeuralTTSClient {
         return hasSyncedServerClock
     }
 
+    private static func setServerClockOffset(_ offset: TimeInterval) {
+        clockLock.lock()
+        serverTimeOffsetSeconds = offset
+        hasSyncedServerClock = true
+        clockLock.unlock()
+    }
+
     private static func currentSyncedTimestamp() -> TimeInterval {
         clockLock.lock()
         let offset = serverTimeOffsetSeconds
@@ -731,10 +738,7 @@ private enum EdgeNeuralTTSClient {
                    let dateHeader = http.value(forHTTPHeaderField: "Date"),
                    let serverDate = df.date(from: dateHeader) {
                     let offset = serverDate.timeIntervalSince1970 - Date().timeIntervalSince1970
-                    clockLock.lock()
-                    serverTimeOffsetSeconds = offset
-                    hasSyncedServerClock = true
-                    clockLock.unlock()
+                    setServerClockOffset(offset)
                     return
                 }
             } catch {
