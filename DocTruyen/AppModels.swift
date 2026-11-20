@@ -63,7 +63,54 @@ struct StoryReadingState: Codable, Equatable {
     var chapterId: String
     var chapterName: String
     var paragraphIndex: Int
+    /// Tỷ lệ vị trí đọc trong chương (0.0 -> 1.0)
+    var scrollRatio: Double
+    /// Tọa độ cuộn chính xác theo pixel/point (contentOffset.y) để khôi phục đúng dòng đang đọc
+    var scrollOffsetY: Double
     var savedAt: TimeInterval
+
+    init(
+        folderId: String,
+        folderStack: [FolderNode],
+        chapterId: String,
+        chapterName: String,
+        paragraphIndex: Int = 0,
+        scrollRatio: Double = 0.0,
+        scrollOffsetY: Double = 0.0,
+        savedAt: TimeInterval = Date().timeIntervalSince1970
+    ) {
+        self.folderId = folderId
+        self.folderStack = folderStack
+        self.chapterId = chapterId
+        self.chapterName = chapterName
+        self.paragraphIndex = paragraphIndex
+        self.scrollRatio = scrollRatio
+        self.scrollOffsetY = scrollOffsetY
+        self.savedAt = savedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case folderId
+        case folderStack
+        case chapterId
+        case chapterName
+        case paragraphIndex
+        case scrollRatio
+        case scrollOffsetY
+        case savedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.folderId = try container.decode(String.self, forKey: .folderId)
+        self.folderStack = try container.decode([FolderNode].self, forKey: .folderStack)
+        self.chapterId = try container.decode(String.self, forKey: .chapterId)
+        self.chapterName = try container.decode(String.self, forKey: .chapterName)
+        self.paragraphIndex = try container.decodeIfPresent(Int.self, forKey: .paragraphIndex) ?? 0
+        self.scrollRatio = try container.decodeIfPresent(Double.self, forKey: .scrollRatio) ?? 0.0
+        self.scrollOffsetY = try container.decodeIfPresent(Double.self, forKey: .scrollOffsetY) ?? 0.0
+        self.savedAt = try container.decodeIfPresent(TimeInterval.self, forKey: .savedAt) ?? Date().timeIntervalSince1970
+    }
 }
 
 struct PersistedReadingData: Codable {

@@ -227,7 +227,7 @@ struct ContentView: View {
         return Menu {
             ForEach(StoryVoiceChoice.allCases) { voice in
                 Button {
-                    speechManager.selectedVoiceChoice = voice
+                    speechManager.selectVoice(voice)
                 } label: {
                     Text(voice.displayName)
                 }
@@ -811,6 +811,17 @@ struct ContentView: View {
         let isSyncedToDrive = LocalChapterStorage.shared.isChapterSyncedToDrive(chapter.id)
         let isCachedOffline = LocalChapterStorage.shared.hasLocalFile(for: chapter.id)
 
+        let savedPercent: Int = {
+            if let st = viewModel.currentStorySavedState, st.chapterId == chapter.id, st.scrollRatio > 0.01 {
+                return min(99, max(1, Int((st.scrollRatio * 100.0).rounded())))
+            }
+            return 0
+        }()
+
+        let activeSubLabel: String = savedPercent > 0
+            ? "Đang đọc dở (\(savedPercent)%) • Đã lưu vị trí"
+            : "Đang đọc dở (Đã lưu trong máy)"
+
         let badgeBg: Color = isActive ? palette.accent : palette.border.opacity(0.45)
         let badgeFg: Color = isActive ? Color.white : palette.secondaryText
         let titleFg: Color = isActive ? palette.accent : palette.primaryText
@@ -836,7 +847,7 @@ struct ContentView: View {
                         .lineLimit(2)
 
                     if isActive {
-                        Text("Đang đọc dở (Đã lưu trong máy)")
+                        Text(activeSubLabel)
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundStyle(palette.accent)
                     } else if isCachedOffline {
@@ -895,81 +906,78 @@ struct ContentView: View {
         let cleanedStoryText = formatCleanStoryBody(viewModel.chapterContent)
 
         VStack(spacing: 0) {
-            ScrollViewReader { scrollProxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
-                        AutoScrollBridge(
-                            isScrolling: viewModel.isAutoScrolling,
-                            speedPointsPerSecond: viewModel.autoScrollSpeed,
-                            onUserDragPause: {
-                                viewModel.isAutoScrolling = false
-                            },
-                            onReachedBottom: {
-                                viewModel.isAutoScrolling = false
-                                if viewModel.autoNextChapterOnScrollEnd &&
-                                    viewModel.currentChapterIndex < viewModel.chapters.count - 1 {
-                                    Task {
-                                        try? await Task.sleep(nanoseconds: 1_200_000_000)
-                                        await viewModel.openNextChapter()
-                                        viewModel.isAutoScrolling = true
-                                    }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    AutoScrollBridge(
+                        chapterId: viewModel.selectedChapter?.id ?? "none",
+                        restoreScrollRatio: viewModel.pendingRestoreScrollRatio,
+                        restoreScrollOffsetY: viewModel.pendingRestoreScrollOffsetY,
+                        restoreToken: viewModel.readerScrollRestoreToken,
+                        isScrolling: viewModel.isAutoScrolling,
+                        speedPointsPerSecond: viewModel.autoScrollSpeed,
+                        onUserDragPause: {
+                            viewModel.isAutoScrolling = false
+                        },
+                        onReachedBottom: {
+                            viewModel.isAutoScrolling = false
+                            if viewModel.autoNextChapterOnScrollEnd &&
+                                viewModel.currentChapterIndex < viewModel.chapters.count - 1 {
+                                Task {
+                                    try? await Task.sleep(nanoseconds: 1_200_000_000)
+                                    await viewModel.openNextChapter()
+                                    viewModel.isAutoScrolling = true
                                 }
-                            },
-                            onScrollProgressChanged: { ratio, isUserDragging in
-                                viewModel.handleReaderScrollChanged(ratio: ratio, isUserInteracting: isUserDragging)
-                            },
-                            onRegisterScrollRatioProvider: { provider in
-                                viewModel.liveScrollRatioProvider = provider
                             }
-                        )
-                        .frame(width: 0, height: 0)
-
-                        Color.clear
-                            .frame(height: 1)
-                            .id("READER_TOP_ANCHOR")
-
-                        Text(viewModel.selectedChapter?.cleanChapterName ?? "")
-                            .font(.system(size: 17, weight: .bold, design: .serif))
-                            .foregroundStyle(palette.secondaryText)
-                            .padding(.bottom, 2)
-
-                        if viewModel.isChapterLoading {
-                            HStack(spacing: 10) {
-                                ProgressView()
-                                    .tint(palette.accent)
-                                Text("Đang tải nội dung chương...")
-                                    .font(.subheadline)
-                                    .foregroundStyle(palette.secondaryText)
-                            }
-                            .padding(.vertical, 20)
+                        },
+                        onScrollProgressChanged: { ratio, offsetY, isUserDragging in
+                            viewModel.handleReaderScrollChanged(
+                                ratio: ratio,
+                                offsetY: offsetY,
+                                isUserInteracting: isUserDragging
+                            )
+                        },
+                        onRegisterScrollRatioProvider: { provider in
+                            viewModel.liveScrollRatioProvider = provider
                         }
+                    )
+                    .frame(width: 0, height: 0)
 
-                        Text(cleanedStoryText)
-                            .font(.system(size: viewModel.storyFontSize, weight: .regular, design: .serif))
-                            .lineSpacing(viewModel.storyFontSize * 0.56)
-                            .foregroundStyle(palette.primaryText)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                    Color.clear
+                        .frame(height: 1)
+                        .id("READER_TOP_ANCHOR")
 
-                        Divider()
-                            .padding(.top, 12)
+                    Text(viewModel.selectedChapter?.cleanChapterName ?? "")
+                        .font(.system(size: 17, weight: .bold, design: .serif))
+                        .foregroundStyle(palette.secondaryText)
+                        .padding(.bottom, 2)
 
-                        readerBottomNavigationRow(palette: palette)
+                    if viewModel.isChapterLoading {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                                .tint(palette.accent)
+                            Text("Đang tải nội dung chương...")
+                                .font(.subheadline)
+                                .foregroundStyle(palette.secondaryText)
+                        }
+                        .padding(.vertical, 20)
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 8)
+
+                    Text(cleanedStoryText)
+                        .font(.system(size: viewModel.storyFontSize, weight: .regular, design: .serif))
+                        .lineSpacing(viewModel.storyFontSize * 0.56)
+                        .foregroundStyle(palette.primaryText)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    Divider()
+                        .padding(.top, 12)
+
+                    readerBottomNavigationRow(palette: palette)
                 }
-                .id("READER_SCROLL_\(viewModel.selectedChapter?.id ?? "none")_\(viewModel.readerScrollResetToken)")
-                .onAppear {
-                    scrollProxy.scrollTo("READER_TOP_ANCHOR", anchor: .top)
-                }
-                .onChange(of: viewModel.selectedChapter?.id) { _ in
-                    scrollProxy.scrollTo("READER_TOP_ANCHOR", anchor: .top)
-                }
-                .onChange(of: viewModel.readerScrollResetToken) { _ in
-                    scrollProxy.scrollTo("READER_TOP_ANCHOR", anchor: .top)
-                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
             }
+            .id("READER_SCROLL_\(viewModel.selectedChapter?.id ?? "none")")
         }
     }
 

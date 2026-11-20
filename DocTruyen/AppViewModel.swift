@@ -94,6 +94,10 @@ final class AppViewModel: ObservableObject {
     @Published var searchQuery: String = ""
 
     @Published var readerScrollResetToken: Int = 0
+    @Published var readerScrollRestoreToken: Int = 0
+    @Published var pendingRestoreScrollRatio: Double = 0.0
+    @Published var pendingRestoreScrollOffsetY: Double = 0.0
+
     @Published var tocScrollResetToken: Int = 0
     @Published var coverRevisionTrigger: Int = 0
 
@@ -117,7 +121,12 @@ final class AppViewModel: ObservableObject {
 
     // MARK: - Auto-Scroll & Text-to-Speech (Nghe truyện)
     @Published var isAutoScrolling: Bool = false {
-        didSet { updateKeepAwakeState() }
+        didSet {
+            updateKeepAwakeState()
+            if !isAutoScrolling && screenMode == .reader {
+                saveReadingProgress()
+            }
+        }
     }
     @Published var showAutoScrollControls: Bool = false
     /// Tốc độ cuộn tính bằng point/giây (15 -> 160 pt/s, mặc định 45 pt/s)
@@ -129,8 +138,12 @@ final class AppViewModel: ObservableObject {
     }
     @Published var showSpeechControls: Bool = false
     @Published var currentReaderScrollRatio: Double = 0.0
+    @Published var currentReaderScrollOffsetY: Double = 0.0
     @Published var didUserScrollWhileSpeechActive: Bool = false
     var liveScrollRatioProvider: (() -> Double)?
+    private var lastScrollPersistTimestamp: TimeInterval = 0
+    private var lastPersistedRatioValue: Double = 0.0
+    private var lastPersistedOffsetYValue: Double = 0.0
 
     // MARK: - AI Gemini Translation Settings & Batch State
     @Published var geminiApiKey: String = "" {
@@ -322,6 +335,46 @@ final class AppViewModel: ObservableObject {
                 self.showToast("Đã tự động tắt nghe truyện theo hẹn giờ")
             }
         }
+        StorySpeechManager.shared.onChunkRatioProgressed = { [weak self] chunkRatio in
+            Task { @MainActor in
+                guard let self, self.screenMode == .reader else { return }
+                // Khi đang nghe truyện mà người dùng không tự cuộn đi chỗ khác, tự động lưu lại tỷ lệ đoạn đang nghe
+                if !self.didUserScrollWhileSpeechActive && chunkRatio > self.currentReaderScrollRatio {
+                    self.currentReaderScrollRatio = chunkRatio
+                    self.saveReadingProgress(scrollRatioOverride: chunkRatio, scrollOffsetYOverride: self.currentReaderScrollOffsetY)
+                }
+            }
+        }
+
+        // Tự động lưu ngay vị trí đang đọc mỗi khi người dùng thoát ra màn hình chính, khóa máy hoặc chuyển app
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.screenMode == .reader else { return }
+                if let liveRatio = self.liveScrollRatioProvider?(), liveRatio > 0.005 {
+                    self.currentReaderScrollRatio = liveRatio
+                }
+                self.saveReadingProgress()
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.screenMode == .reader else { return }
+                if let liveRatio = self.liveScrollRatioProvider?(), liveRatio > 0.005 {
+                    self.currentReaderScrollRatio = liveRatio
+                }
+                self.saveReadingProgress()
+            }
+        }
+
         Task {
             await initializeApp()
         }
@@ -441,7 +494,7 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Reading State Persistence
+    // MARK: - Reading State Persistence (Lưu đầy đủ cả chương lẫn vị trí đang đọc giữa chương)
     private func loadPersistedReadingData() -> PersistedReadingData {
         guard let data = UserDefaults.standard.data(forKey: readingStateStorageKey),
               var decoded = try? JSONDecoder().decode(PersistedReadingData.self, from: data) else {
@@ -465,10 +518,18 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    func saveReadingProgress(paragraphIndex: Int = 0, chapterOverride: DriveItem? = nil) {
+    func saveReadingProgress(
+        paragraphIndex: Int = 0,
+        chapterOverride: DriveItem? = nil,
+        scrollRatioOverride: Double? = nil,
+        scrollOffsetYOverride: Double? = nil
+    ) {
         guard let chapter = chapterOverride ?? selectedChapter else { return }
         let storyFolderId = currentFolder.id
         guard !storyFolderId.isEmpty else { return }
+
+        let ratioToSave = min(1.0, max(0.0, scrollRatioOverride ?? currentReaderScrollRatio))
+        let offsetYToSave = max(0.0, scrollOffsetYOverride ?? currentReaderScrollOffsetY)
 
         let state = StoryReadingState(
             folderId: storyFolderId,
@@ -476,14 +537,19 @@ final class AppViewModel: ObservableObject {
             chapterId: chapter.id,
             chapterName: chapter.cleanChapterName,
             paragraphIndex: paragraphIndex,
+            scrollRatio: ratioToSave,
+            scrollOffsetY: offsetYToSave,
             savedAt: Date().timeIntervalSince1970
         )
         readingStates[storyFolderId] = state
         lastReadingFolderId = storyFolderId
+        lastPersistedRatioValue = ratioToSave
+        lastPersistedOffsetYValue = offsetYToSave
+        lastScrollPersistTimestamp = Date().timeIntervalSince1970
         persistReadingData()
     }
 
-    // MARK: - App Initialization & Instant Offline Restore
+    // MARK: - App Initialization & Instant Offline Restore (Khôi phục đúng chương & đúng vị trí đang đọc giữa chương)
     func initializeApp() async {
         let rootNode = FolderNode(id: activeRootFolderId, name: "")
         folderStack = [rootNode]
@@ -512,8 +578,12 @@ final class AppViewModel: ObservableObject {
                 folders = []
                 selectedChapter = savedChapter
                 chapterContent = localChapterText
+                currentReaderScrollRatio = lastState.scrollRatio
+                currentReaderScrollOffsetY = lastState.scrollOffsetY
+                pendingRestoreScrollRatio = lastState.scrollRatio
+                pendingRestoreScrollOffsetY = lastState.scrollOffsetY
                 screenMode = .reader
-                readerScrollResetToken += 1
+                readerScrollRestoreToken += 1
 
                 if let idx = diskFolder.chapters.firstIndex(where: { $0.id == savedChapter.id }) {
                     tocStartIndex = computeTocStart(for: idx)
@@ -737,11 +807,14 @@ final class AppViewModel: ObservableObject {
         nextSwipePromptVisible = false
 
         if screenMode == .reader {
+            if let liveRatio = liveScrollRatioProvider?(), liveRatio > 0.005 {
+                currentReaderScrollRatio = liveRatio
+            }
+            saveReadingProgress()
             isAutoScrolling = false
             showAutoScrollControls = false
             StorySpeechManager.shared.stop()
             showSpeechControls = false
-            saveReadingProgress()
             screenMode = .chapters
             return
         }
@@ -803,25 +876,45 @@ final class AppViewModel: ObservableObject {
     }
 
     func openChapter(_ chapter: DriveItem) async {
+        // Nếu đang ở màn hình đọc của chương cũ và chuyển sang chương khác, lưu lại vị trí chương cũ hoặc cập nhật chương mới
         errorMessage = ""
         selectedChapter = chapter
         tocVisible = false
         nextSwipePromptVisible = false
-        currentReaderScrollRatio = 0.0
         didUserScrollWhileSpeechActive = false
+
+        // Kiểm tra xem chương vừa bấm mở có phải là chương đang đọc dở đã lưu vị trí giữa chương hay không
+        let existingSavedState: StoryReadingState? = {
+            if let saved = readingStates[currentFolder.id], saved.chapterId == chapter.id {
+                return saved
+            }
+            return nil
+        }()
+        let restoreRatio = existingSavedState?.scrollRatio ?? 0.0
+        let restoreOffsetY = existingSavedState?.scrollOffsetY ?? 0.0
+
+        currentReaderScrollRatio = restoreRatio
+        currentReaderScrollOffsetY = restoreOffsetY
+        pendingRestoreScrollRatio = restoreRatio
+        pendingRestoreScrollOffsetY = restoreOffsetY
 
         if let localSaved = LocalChapterStorage.shared.readChapterContent(chapterId: chapter.id),
            !localSaved.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             chapterContentCache[chapter.id] = localSaved
             chapterContent = localSaved
             screenMode = .reader
-            readerScrollResetToken += 1
+            readerScrollRestoreToken += 1
 
             if let idx = chapters.firstIndex(where: { $0.id == chapter.id }) {
                 tocStartIndex = computeTocStart(for: idx)
                 prefetchNextChapter(after: idx)
             }
-            saveReadingProgress(paragraphIndex: 0, chapterOverride: chapter)
+            saveReadingProgress(
+                paragraphIndex: 0,
+                chapterOverride: chapter,
+                scrollRatioOverride: restoreRatio,
+                scrollOffsetYOverride: restoreOffsetY
+            )
             return
         }
 
@@ -829,13 +922,18 @@ final class AppViewModel: ObservableObject {
            !cached.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             chapterContent = cached
             screenMode = .reader
-            readerScrollResetToken += 1
+            readerScrollRestoreToken += 1
 
             if let idx = chapters.firstIndex(where: { $0.id == chapter.id }) {
                 tocStartIndex = computeTocStart(for: idx)
                 prefetchNextChapter(after: idx)
             }
-            saveReadingProgress(paragraphIndex: 0, chapterOverride: chapter)
+            saveReadingProgress(
+                paragraphIndex: 0,
+                chapterOverride: chapter,
+                scrollRatioOverride: restoreRatio,
+                scrollOffsetYOverride: restoreOffsetY
+            )
             return
         }
 
@@ -846,14 +944,21 @@ final class AppViewModel: ObservableObject {
             let text = try await fetchChapterText(chapter)
             if selectedChapter?.id == chapter.id {
                 chapterContent = text
-                readerScrollResetToken += 1
+                pendingRestoreScrollRatio = restoreRatio
+                pendingRestoreScrollOffsetY = restoreOffsetY
+                readerScrollRestoreToken += 1
             }
 
             if let idx = chapters.firstIndex(where: { $0.id == chapter.id }) {
                 tocStartIndex = computeTocStart(for: idx)
                 prefetchNextChapter(after: idx)
             }
-            saveReadingProgress(paragraphIndex: 0, chapterOverride: chapter)
+            saveReadingProgress(
+                paragraphIndex: 0,
+                chapterOverride: chapter,
+                scrollRatioOverride: restoreRatio,
+                scrollOffsetYOverride: restoreOffsetY
+            )
         } catch {
             errorMessage = error.localizedDescription
             if selectedChapter?.id == chapter.id {
@@ -866,13 +971,26 @@ final class AppViewModel: ObservableObject {
     func openNextChapter() async {
         let idx = currentChapterIndex
         guard idx >= 0, idx + 1 < chapters.count else { return }
-        await openChapter(chapters[idx + 1])
+        let nextChap = chapters[idx + 1]
+        // Khi chủ động bấm sang chương sau, mở chương sau từ đầu (0.0)
+        if var state = readingStates[currentFolder.id], state.chapterId == nextChap.id {
+            state.scrollRatio = 0.0
+            state.scrollOffsetY = 0.0
+            readingStates[currentFolder.id] = state
+        }
+        await openChapter(nextChap)
     }
 
     func openPreviousChapter() async {
         let idx = currentChapterIndex
         guard idx > 0 else { return }
-        await openChapter(chapters[idx - 1])
+        let prevChap = chapters[idx - 1]
+        if var state = readingStates[currentFolder.id], state.chapterId == prevChap.id {
+            state.scrollRatio = 0.0
+            state.scrollOffsetY = 0.0
+            readingStates[currentFolder.id] = state
+        }
+        await openChapter(prevChap)
     }
 
     private func prefetchNextChapter(after index: Int) {
@@ -916,7 +1034,7 @@ final class AppViewModel: ObservableObject {
         tocScrollResetToken += 1
     }
 
-    // MARK: - Gemini Translation (Phương án 1 + 4: Dịch song song 2 chương cùng lúc + Tách luồng Ghi đè Drive chạy ngầm)
+    // MARK: - Gemini Translation
     func prepareAndOpenTranslationPopup() {
         guard !chapters.isEmpty else {
             showToast("Không có chương nào để dịch.")
@@ -1376,7 +1494,9 @@ final class AppViewModel: ObservableObject {
             let original = try await fetchChapterText(chapter, forceRemote: true)
             if selectedChapter?.id == chapter.id {
                 chapterContent = original
-                readerScrollResetToken += 1
+                pendingRestoreScrollRatio = 0.0
+                pendingRestoreScrollOffsetY = 0.0
+                readerScrollRestoreToken += 1
             }
             translatedRevisionTrigger += 1
             showToast("Đã khôi phục bản gốc từ Google Drive")
@@ -1385,10 +1505,11 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Điều khiển Tự động cuộn & Nghe truyện
+    // MARK: - Điều khiển Tự động cuộn, Lưu vị trí đọc & Nghe truyện
     func toggleAutoScroll() {
         if isAutoScrolling {
             isAutoScrolling = false
+            saveReadingProgress()
         } else {
             if StorySpeechManager.shared.isSpeaking {
                 StorySpeechManager.shared.stop()
@@ -1402,17 +1523,30 @@ final class AppViewModel: ObservableObject {
     func stopAutoScroll() {
         isAutoScrolling = false
         showAutoScrollControls = false
+        saveReadingProgress()
     }
 
     func adjustAutoScrollSpeed(delta: Double) {
         autoScrollSpeed = min(160, max(15, autoScrollSpeed + delta))
     }
 
-    func handleReaderScrollChanged(ratio: Double, isUserInteracting: Bool) {
-        let previous = currentReaderScrollRatio
+    func handleReaderScrollChanged(ratio: Double, offsetY: Double, isUserInteracting: Bool) {
+        let previousRatio = currentReaderScrollRatio
         currentReaderScrollRatio = ratio
-        if isUserInteracting && StorySpeechManager.shared.isSpeaking && abs(ratio - previous) > 0.008 {
+        currentReaderScrollOffsetY = offsetY
+
+        if isUserInteracting && StorySpeechManager.shared.isSpeaking && abs(ratio - previousRatio) > 0.008 {
             didUserScrollWhileSpeechActive = true
+        }
+
+        // Lưu tự động vị trí cuộn vào bộ nhớ máy khi người đọc cuộn trang hoặc đang bật tự động cuộn
+        guard screenMode == .reader, isUserInteracting || isAutoScrolling else { return }
+        let now = Date().timeIntervalSince1970
+        let ratioDelta = abs(ratio - lastPersistedRatioValue)
+        let offsetDelta = abs(offsetY - lastPersistedOffsetYValue)
+
+        if (now - lastScrollPersistTimestamp >= 0.75) && (ratioDelta >= 0.006 || offsetDelta >= 28.0) {
+            saveReadingProgress(scrollRatioOverride: ratio, scrollOffsetYOverride: offsetY)
         }
     }
 
@@ -1420,6 +1554,7 @@ final class AppViewModel: ObservableObject {
         let speech = StorySpeechManager.shared
         let activeRatio = liveScrollRatioProvider?() ?? currentReaderScrollRatio
         currentReaderScrollRatio = activeRatio
+        saveReadingProgress(scrollRatioOverride: activeRatio, scrollOffsetYOverride: currentReaderScrollOffsetY)
 
         if speech.isSpeaking {
             if didUserScrollWhileSpeechActive {
@@ -1442,6 +1577,7 @@ final class AppViewModel: ObservableObject {
     }
 
     func stopSpeechPlayback() {
+        saveReadingProgress()
         StorySpeechManager.shared.stop()
         showSpeechControls = false
         didUserScrollWhileSpeechActive = false
@@ -1457,9 +1593,16 @@ final class AppViewModel: ObservableObject {
             updateKeepAwakeState()
             return
         }
-        await openChapter(chapters[idx + 1])
+        let nextChap = chapters[idx + 1]
+        if var state = readingStates[currentFolder.id], state.chapterId == nextChap.id {
+            state.scrollRatio = 0.0
+            state.scrollOffsetY = 0.0
+            readingStates[currentFolder.id] = state
+        }
+        await openChapter(nextChap)
         if screenMode == .reader && !chapterContent.isEmpty && !isChapterLoading {
             currentReaderScrollRatio = 0.0
+            currentReaderScrollOffsetY = 0.0
             didUserScrollWhileSpeechActive = false
             let title = selectedChapter?.cleanChapterName ?? ""
             StorySpeechManager.shared.startSpeaking(title: title, text: chapterContent, fromScrollRatio: 0.0)
