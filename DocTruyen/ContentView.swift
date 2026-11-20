@@ -34,7 +34,7 @@ struct ContentView: View {
 
             if !viewModel.toastMessage.isEmpty {
                 toastCapsule
-                    .padding(.bottom, (viewModel.screenMode == .reader && viewModel.showSpeechControls) ? 88 : 24)
+                    .padding(.bottom, (viewModel.screenMode == .reader && viewModel.showSpeechControls) ? 124 : 24)
             }
         }
         .sheet(isPresented: $viewModel.showSettingsSheet) {
@@ -60,14 +60,22 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Thanh điều khiển nổi Nghe truyện AI (Đã tách nhỏ View để trình biên dịch Swift không bao giờ bị treo)
+    // MARK: - Thanh điều khiển nổi Nghe truyện AI + Hẹn giờ tắt (5, 10, 15, 30, 45, 60 phút)
     private func readerFloatingUtilityBar(palette: ThemePalette) -> some View {
-        HStack(spacing: 8) {
-            speechTransportButtons(palette: palette)
-            speechVoiceSelectorMenu(palette: palette)
-            Spacer(minLength: 4)
-            speechSpeedControls(palette: palette)
-            speechCloseButton(palette: palette)
+        VStack(spacing: 7) {
+            HStack(spacing: 8) {
+                speechTransportButtons(palette: palette)
+                speechVoiceSelectorMenu(palette: palette)
+                Spacer(minLength: 4)
+                speechSpeedControls(palette: palette)
+                speechCloseButton(palette: palette)
+            }
+
+            Rectangle()
+                .fill(palette.border.opacity(0.65))
+                .frame(height: 0.5)
+
+            speechSleepTimerRow(palette: palette)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
@@ -78,6 +86,90 @@ struct ContentView: View {
         )
         .clipShape(RoundedRectangle(cornerRadius: 18))
         .shadow(color: Color.black.opacity(0.12), radius: 10, x: 0, y: 4)
+    }
+
+    private func speechSleepTimerRow(palette: ThemePalette) -> some View {
+        let isActive: Bool = speechManager.isSleepTimerActive
+        let iconName: String = isActive ? "timer" : "moon.zzz.fill"
+        let labelText: String = isActive ? speechManager.formattedSleepTimerCountdown : "Hẹn giờ"
+        let labelColor: Color = isActive ? Color.orange : palette.secondaryText
+
+        return HStack(spacing: 5) {
+            Menu {
+                ForEach(StorySpeechManager.sleepTimerPresets, id: \.self) { mins in
+                    Button {
+                        speechManager.setSleepTimer(minutes: mins)
+                        viewModel.showToast("Đã hẹn giờ tắt nghe truyện sau \(mins) phút")
+                    } label: {
+                        Text("\(mins) phút")
+                    }
+                }
+                if isActive {
+                    Button(role: .destructive) {
+                        speechManager.setSleepTimer(minutes: nil)
+                        viewModel.showToast("Đã hủy hẹn giờ tắt nghe truyện")
+                    } label: {
+                        Text("Tắt hẹn giờ")
+                    }
+                }
+            } label: {
+                HStack(spacing: 3) {
+                    Image(systemName: iconName)
+                        .font(.system(size: 11, weight: .bold))
+                    Text(labelText)
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(labelColor)
+                .fixedSize(horizontal: true, vertical: false)
+            }
+
+            Spacer(minLength: 2)
+
+            HStack(spacing: 4) {
+                ForEach(StorySpeechManager.sleepTimerPresets, id: \.self) { mins in
+                    sleepTimerPresetButton(minutes: mins, palette: palette)
+                }
+
+                if isActive {
+                    Button {
+                        speechManager.setSleepTimer(minutes: nil)
+                        viewModel.showToast("Đã hủy hẹn giờ tắt nghe truyện")
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .bold))
+                            .frame(width: 20, height: 20)
+                            .background(Color.orange.opacity(0.18))
+                            .foregroundStyle(Color.orange)
+                            .clipShape(Circle())
+                    }
+                }
+            }
+        }
+    }
+
+    private func sleepTimerPresetButton(minutes: Int, palette: ThemePalette) -> some View {
+        let isSelected: Bool = speechManager.isSleepTimerActive && (speechManager.activeSleepTimerMinutes == minutes)
+        let bgColor: Color = isSelected ? Color.orange : palette.accent.opacity(0.13)
+        let fgColor: Color = isSelected ? Color.white : palette.primaryText
+
+        return Button {
+            if isSelected {
+                speechManager.setSleepTimer(minutes: nil)
+                viewModel.showToast("Đã hủy hẹn giờ tắt nghe truyện")
+            } else {
+                speechManager.setSleepTimer(minutes: minutes)
+                viewModel.showToast("Đã hẹn giờ tắt nghe truyện sau \(minutes) phút")
+            }
+        } label: {
+            Text("\(minutes)p")
+                .font(.system(size: 10, weight: .bold, design: .rounded))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+                .background(bgColor)
+                .foregroundStyle(fgColor)
+                .clipShape(Capsule())
+        }
     }
 
     private func speechTransportButtons(palette: ThemePalette) -> some View {
@@ -941,7 +1033,7 @@ struct ContentView: View {
             .disabled(!hasNext)
         }
         .padding(.top, 6)
-        .padding(.bottom, viewModel.showSpeechControls ? 86 : 26)
+        .padding(.bottom, viewModel.showSpeechControls ? 118 : 26)
     }
 
     private func formatCleanStoryBody(_ raw: String) -> String {

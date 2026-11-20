@@ -312,6 +312,16 @@ final class AppViewModel: ObservableObject {
                 self?.showToast(message)
             }
         }
+        StorySpeechManager.shared.onSleepTimerExpired = { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.showSpeechControls = false
+                self.didUserScrollWhileSpeechActive = false
+                self.saveReadingProgress()
+                self.updateKeepAwakeState()
+                self.showToast("Đã tự động tắt nghe truyện theo hẹn giờ")
+            }
+        }
         Task {
             await initializeApp()
         }
@@ -529,8 +539,6 @@ final class AppViewModel: ObservableObject {
 
     func refreshCurrentFolder() async {
         if screenMode == .folders {
-            // Khi vuốt làm mới ở danh sách truyện bên ngoài -> Xóa toàn bộ cache danh sách chương của tất cả bộ truyện
-            // để khi bấm vào bất kỳ bộ truyện nào cũng tải đủ 100% số chương mới nhất từ Google Drive.
             folderCache.removeAll()
             LocalChapterStorage.shared.clearFolderDiskCache()
         } else {
@@ -1443,6 +1451,7 @@ final class AppViewModel: ObservableObject {
     func handleSpeechChapterFinished() async {
         let idx = currentChapterIndex
         guard idx >= 0, idx + 1 < chapters.count else {
+            StorySpeechManager.shared.setSleepTimer(minutes: nil)
             showToast("Đã đọc xong chương cuối cùng!")
             showSpeechControls = false
             updateKeepAwakeState()

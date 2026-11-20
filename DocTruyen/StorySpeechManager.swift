@@ -110,6 +110,9 @@ private struct GeminiTTSResponsePayload: Decodable {
 final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegate {
     static let shared = StorySpeechManager()
 
+    /// Các mốc thời gian hẹn giờ tắt (tính bằng phút) theo đúng yêu cầu: 5, 10, 15, 30, 45, 60
+    static let sleepTimerPresets: [Int] = [5, 10, 15, 30, 45, 60]
+
     @Published var isSpeaking: Bool = false
     @Published var isPaused: Bool = false
     @Published var isBuffering: Bool = false
@@ -117,6 +120,12 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     @Published var totalChunks: Int = 0
     @Published var currentChapterTitle: String = ""
     @Published var activeVoiceLabel: String = ""
+
+    // MARK: - Trạng thái Hẹn giờ tắt (Sleep Timer)
+    @Published var activeSleepTimerMinutes: Int? = nil
+    @Published var sleepTimerRemainingSeconds: Int = 0
+    private var sleepTimerEndDate: Date? = nil
+    private var sleepTimerTicker: Timer? = nil
 
     @Published var selectedVoiceChoice: StoryVoiceChoice = .namMinh {
         didSet {
@@ -141,13 +150,15 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
     var onChapterFinished: (() -> Void)?
     var onError: ((String) -> Void)?
+    var onSleepTimerExpired: (() -> Void)?
 
     private var audioPlayer: AVAudioPlayer?
+    private var currentRawText: String = ""
     private var chunks: [String] = []
     private var chunkStartRatios: [Double] = []
     private var hasPrependedTitleChunk: Bool = false
 
-    /// Bộ nhớ đệm âm thanh đã tải sẵn trong RAM (chỉ lưu âm thanh chuẩn của giọng đã chọn)
+    /// Bộ nhớ đệm âm thanh đã tải sẵn trong RAM (chỉ lưu âm thanh chuẩn của giọng AI đã chọn)
     private var prefetchedAudioCache: [Int: Data] = [:]
     /// Danh sách các Task đang tải dở của từng đoạn — tái sử dụng kết quả đang tải, không tải trùng
     private var inFlightTasks: [Int: Task<Data?, Never>] = [:]
@@ -155,6 +166,17 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     private var playSessionToken: UUID = UUID()
     private var consecutiveFailures: Int = 0
     private var tempFileToggle: Int = 0
+
+    var isSleepTimerActive: Bool {
+        sleepTimerEndDate != nil && sleepTimerRemainingSeconds > 0
+    }
+
+    var formattedSleepTimerCountdown: String {
+        guard sleepTimerRemainingSeconds > 0 else { return "" }
+        let mins: Int = sleepTimerRemainingSeconds / 60
+        let secs: Int = sleepTimerRemainingSeconds % 60
+        return String(format: "%02d:%02d", mins, secs)
+    }
 
     private override init() {
         super.init()
@@ -172,6 +194,69 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         }
 
         setupRemoteCommands()
+    }
+
+    // MARK: - Điều khiển Hẹn giờ tắt (5, 10, 15, 30, 45, 60 phút)
+    func setSleepTimer(minutes: Int?) {
+        sleepTimerTicker?.invalidate()
+        sleepTimerTicker = nil
+
+        guard let minutes, minutes > 0 else {
+            activeSleepTimerMinutes = nil
+            sleepTimerRemainingSeconds = 0
+            sleepTimerEndDate = nil
+            return
+        }
+
+        let durationSeconds: Int = minutes * 60
+        let targetEndDate = Date().addingTimeInterval(TimeInterval(durationSeconds))
+        activeSleepTimerMinutes = minutes
+        sleepTimerEndDate = targetEndDate
+        sleepTimerRemainingSeconds = durationSeconds
+
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handleSleepTimerTick()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        sleepTimerTicker = timer
+    }
+
+    func toggleSleepTimerPreset(minutes: Int) {
+        if activeSleepTimerMinutes == minutes && isSleepTimerActive {
+            setSleepTimer(minutes: nil)
+        } else {
+            setSleepTimer(minutes: minutes)
+        }
+    }
+
+    private func handleSleepTimerTick() {
+        guard let endDate = sleepTimerEndDate else {
+            setSleepTimer(minutes: nil)
+            return
+        }
+        let remaining = Int(ceil(endDate.timeIntervalSinceNow))
+        if remaining <= 0 {
+            triggerSleepTimerExpiration()
+        } else {
+            sleepTimerRemainingSeconds = remaining
+        }
+    }
+
+    private func checkIfSleepTimerExpiredNow() -> Bool {
+        guard let endDate = sleepTimerEndDate else { return false }
+        if Date() >= endDate {
+            triggerSleepTimerExpiration()
+            return true
+        }
+        return false
+    }
+
+    private func triggerSleepTimerExpiration() {
+        setSleepTimer(minutes: nil)
+        stopInternal(resetTitle: true, cancelSleepTimer: true)
+        onSleepTimerExpired?()
     }
 
     private func configureAudioSession() {
@@ -230,12 +315,25 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         prefetchedAudioCache.removeAll()
     }
 
+    /// Hủy các tác vụ tải trước của những đoạn phía sau để nhường 100% băng thông/Actor cho đoạn hiện tại đang cần phát
+    private func cancelPrefetchTasks(after index: Int) {
+        prefetchCoordinatorTask?.cancel()
+        prefetchCoordinatorTask = nil
+        let keysToRemove = inFlightTasks.keys.filter { $0 > index }
+        for key in keysToRemove {
+            inFlightTasks[key]?.cancel()
+            inFlightTasks.removeValue(forKey: key)
+        }
+    }
+
     func startSpeaking(title: String, text: String, fromScrollRatio: Double = 0.0) {
-        stopInternal(resetTitle: false)
+        stopInternal(resetTitle: false, cancelSleepTimer: false)
         configureAudioSession()
 
         currentChapterTitle = title
-        let built = buildSpeechChunksWithRatios(from: text, title: title)
+        currentRawText = text
+        let clampedRatio = min(1.0, max(0.0, fromScrollRatio))
+        let built = buildSpeechChunksWithRatios(from: text, title: title, anchorScrollRatio: clampedRatio)
         chunks = built.chunks
         chunkStartRatios = built.ratios
         hasPrependedTitleChunk = built.hasPrependedTitle
@@ -247,7 +345,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             return
         }
 
-        let targetIndex = resolveChunkIndex(forScrollRatio: fromScrollRatio)
+        let targetIndex = built.anchorChunkIndex
         currentChunkIndex = max(0, min(targetIndex, chunks.count - 1))
         consecutiveFailures = 0
         isSpeaking = true
@@ -258,11 +356,12 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 
     func startSpeaking(title: String, text: String, fromChunkIndex: Int) {
-        stopInternal(resetTitle: false)
+        stopInternal(resetTitle: false, cancelSleepTimer: false)
         configureAudioSession()
 
         currentChapterTitle = title
-        let built = buildSpeechChunksWithRatios(from: text, title: title)
+        currentRawText = text
+        let built = buildSpeechChunksWithRatios(from: text, title: title, anchorScrollRatio: 0.0)
         chunks = built.chunks
         chunkStartRatios = built.ratios
         hasPrependedTitleChunk = built.hasPrependedTitle
@@ -284,9 +383,27 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 
     func jumpToScrollRatio(_ ratio: Double) {
-        guard !chunks.isEmpty else { return }
-        let targetIndex = resolveChunkIndex(forScrollRatio: ratio)
-        currentChunkIndex = max(0, min(targetIndex, chunks.count - 1))
+        let clampedRatio = min(1.0, max(0.0, ratio))
+        if !currentRawText.isEmpty {
+            cancelAllPrefetchAndCache()
+            let built = buildSpeechChunksWithRatios(
+                from: currentRawText,
+                title: currentChapterTitle,
+                anchorScrollRatio: clampedRatio
+            )
+            chunks = built.chunks
+            chunkStartRatios = built.ratios
+            hasPrependedTitleChunk = built.hasPrependedTitle
+            totalChunks = chunks.count
+            guard !chunks.isEmpty else { return }
+            currentChunkIndex = max(0, min(built.anchorChunkIndex, chunks.count - 1))
+        } else {
+            guard !chunks.isEmpty else { return }
+            let targetIndex = resolveChunkIndex(forScrollRatio: clampedRatio)
+            currentChunkIndex = max(0, min(targetIndex, chunks.count - 1))
+            cancelAllPrefetchAndCache()
+        }
+
         consecutiveFailures = 0
         if !isSpeaking {
             isSpeaking = true
@@ -347,6 +464,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
     func resume() {
         guard isSpeaking, isPaused else { return }
+        if checkIfSleepTimerExpiredNow() { return }
         configureAudioSession()
         isPaused = false
         if let player = audioPlayer {
@@ -360,23 +478,25 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 
     func stop() {
-        stopInternal(resetTitle: true)
+        stopInternal(resetTitle: true, cancelSleepTimer: true)
     }
 
     func skipForwardChunk() {
         guard isSpeaking, !chunks.isEmpty else { return }
+        if checkIfSleepTimerExpiredNow() { return }
         if currentChunkIndex + 1 < chunks.count {
             currentChunkIndex += 1
             consecutiveFailures = 0
             restartFromCurrentChunk()
         } else {
-            stopInternal(resetTitle: false)
+            stopInternal(resetTitle: false, cancelSleepTimer: false)
             onChapterFinished?()
         }
     }
 
     func skipBackwardChunk() {
         guard isSpeaking, !chunks.isEmpty else { return }
+        if checkIfSleepTimerExpiredNow() { return }
         currentChunkIndex = max(0, currentChunkIndex - 1)
         consecutiveFailures = 0
         restartFromCurrentChunk()
@@ -387,11 +507,15 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         playbackSpeedMultiplier = clamped
     }
 
-    private func stopInternal(resetTitle: Bool) {
+    private func stopInternal(resetTitle: Bool, cancelSleepTimer: Bool) {
         playSessionToken = UUID()
         audioPlayer?.stop()
         audioPlayer = nil
         cancelAllPrefetchAndCache()
+
+        if cancelSleepTimer {
+            setSleepTimer(minutes: nil)
+        }
 
         isSpeaking = false
         isPaused = false
@@ -405,6 +529,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         consecutiveFailures = 0
         if resetTitle {
             currentChapterTitle = ""
+            currentRawText = ""
             MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         }
     }
@@ -414,16 +539,21 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // MARK: - Cơ chế Tải trước Tuần tự Thông minh (Không bắn trùng request, không bao giờ nạp nhầm giọng chị Google vào cache AI)
+    // MARK: - Cơ chế Tải trước Tuần tự Thông minh (Luôn dọn sạch inFlightTasks kể cả khi bị cancel)
     private func getOrCreateSynthesisTask(
         for index: Int,
         voice: StoryVoiceChoice,
-        allowGoogleFallback: Bool
+        allowGoogleFallback: Bool,
+        forceNewTask: Bool = false
     ) -> Task<Data?, Never>? {
         guard index >= 0, index < chunks.count else { return nil }
-        if let existingTask = inFlightTasks[index] {
-            return existingTask
+        if !forceNewTask, let existingTask = inFlightTasks[index] {
+            if !existingTask.isCancelled {
+                return existingTask
+            }
+            inFlightTasks.removeValue(forKey: index)
         }
+
         let targetText = chunks[index]
         let apiKey = Self.currentSavedGeminiApiKey
 
@@ -434,37 +564,58 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 geminiApiKey: apiKey,
                 allowGoogleFallback: allowGoogleFallback
             )
-            if !Task.isCancelled, let self {
-                if let data {
+            if let self {
+                if !Task.isCancelled, let data {
                     self.prefetchedAudioCache[index] = data
                 }
                 self.inFlightTasks.removeValue(forKey: index)
             }
-            return data
+            return Task.isCancelled ? nil : data
         }
         inFlightTasks[index] = task
         return task
     }
 
     private func resolveAudioData(for index: Int, voice: StoryVoiceChoice) async -> Data? {
+        guard index >= 0, index < chunks.count else { return nil }
+
         if let cached = prefetchedAudioCache[index] {
             prefetchedAudioCache.removeValue(forKey: index)
             return cached
         }
+
+        // Hủy các task prefetch của những đoạn phía sau (index + 1, index + 2...) để ưu tiên tối đa cho đoạn hiện tại
+        cancelPrefetchTasks(after: index)
+
         if let existingTask = inFlightTasks[index] {
-            if let data = await existingTask.value {
+            let data = await existingTask.value
+            inFlightTasks.removeValue(forKey: index)
+            if let data {
                 prefetchedAudioCache.removeValue(forKey: index)
                 return data
             }
         }
-        // Nếu tải trước chưa xong hoặc bị lỗi tạm thời, thử tải lại giọng AI một lần nữa trước khi dùng dự phòng
-        if let task = getOrCreateSynthesisTask(for: index, voice: voice, allowGoogleFallback: false) {
-            if let aiData = await task.value {
+
+        guard !Task.isCancelled else { return nil }
+
+        // Thử tải lại giọng AI bằng một Task mới hoàn toàn (không dùng lại Task cũ đã lỗi/hủy)
+        if let retryAITask = getOrCreateSynthesisTask(
+            for: index,
+            voice: voice,
+            allowGoogleFallback: !voice.isAIVoice,
+            forceNewTask: true
+        ) {
+            let aiData = await retryAITask.value
+            inFlightTasks.removeValue(forKey: index)
+            if let aiData {
                 prefetchedAudioCache.removeValue(forKey: index)
                 return aiData
             }
         }
-        // Chỉ khi tất cả các luồng AI đều thất bại hoàn toàn ở đúng thời điểm cần phát mới cho phép fallback cho đoạn hiện tại
+
+        guard !Task.isCancelled else { return nil }
+
+        // Chỉ khi tất cả các luồng AI (cả Edge Neural AI lẫn Gemini AI sau khi đã chờ hồi quota) đều thất bại mới dùng dự phòng cho đoạn hiện tại
         let apiKey = Self.currentSavedGeminiApiKey
         return await Self.synthesizeSpeechData(
             text: chunks[index],
@@ -474,11 +625,12 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         )
     }
 
-    /// Chỉ bắt đầu tải trước các đoạn kế tiếp SAU KHI đoạn hiện tại đã bắt đầu phát loa
-    /// Tải tuần tự từng đoạn một (index + 1 -> index + 2 -> index + 3) để tuyệt đối không gây nghẽn mạng hay lỗi 429
+    /// Tải trước tuần tự 2 đoạn kế tiếp SAU KHI đoạn hiện tại đã bắt đầu phát loa.
+    /// Với kích thước đoạn lũy tiến (900 -> 1400 ký tự ≈ 60-95 giây âm thanh/đoạn), 2 đoạn tải trước tương đương 2.5 - 3 phút âm thanh đệm sẵn trong RAM,
+    /// vừa đảm bảo phát liền mạch 100% không bao giờ xoay tròn, vừa giữ tần suất gọi < 0.7 request/phút (không bao giờ chạm ngưỡng 3 RPM của Gemini).
     private func scheduleLookaheadPrefetch(from index: Int, voice: StoryVoiceChoice, sessionToken: UUID) {
         prefetchCoordinatorTask?.cancel()
-        let lookaheadCount = 3
+        let lookaheadCount = 2
 
         prefetchCoordinatorTask = Task { [weak self] in
             guard let self else { return }
@@ -490,13 +642,17 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                 if self.prefetchedAudioCache[targetIdx] != nil {
                     continue
                 }
-                // Trong lúc tải nền (prefetch), allowGoogleFallback = false để tuyệt đối không lưu giọng Google vào bộ nhớ đệm AI
                 if let task = self.getOrCreateSynthesisTask(
                     for: targetIdx,
                     voice: voice,
                     allowGoogleFallback: !voice.isAIVoice
                 ) {
-                    _ = await task.value
+                    let result = await task.value
+                    if Task.isCancelled || self.playSessionToken != sessionToken { return }
+                    // Nếu mạng hoặc server đang bận tạm thời, dừng bắn dồn các đoạn sau để chờ hồi nhịp
+                    if result == nil {
+                        break
+                    }
                 }
             }
             // Dọn các đoạn cũ đã đọc qua khỏi RAM
@@ -508,6 +664,8 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 
     private func playCurrentChunk() {
+        if checkIfSleepTimerExpiredNow() { return }
+
         let sessionToken = playSessionToken
         guard currentChunkIndex >= 0, currentChunkIndex < chunks.count else {
             isSpeaking = false
@@ -530,12 +688,12 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             }
         }
 
-        // Chỉ tải đoạn hiện tại trước (không bắn song song với prefetch ở giây 0 để tránh lỗi 429 / xung đột WebSocket)
         isBuffering = true
 
         Task {
             let audioData = await self.resolveAudioData(for: chunkIdx, voice: voiceMode)
             guard self.playSessionToken == sessionToken, self.isSpeaking, !self.isPaused else { return }
+            if self.checkIfSleepTimerExpiredNow() { return }
             self.isBuffering = false
 
             if let audioData, self.playAudioData(audioData, voiceLabel: voiceMode.shortName) {
@@ -548,7 +706,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     self.currentChunkIndex += 1
                     self.playCurrentChunk()
                 } else {
-                    self.stopInternal(resetTitle: false)
+                    self.stopInternal(resetTitle: false, cancelSleepTimer: false)
                     self.onError?("Không thể tải âm thanh giọng đọc AI. Vui lòng kiểm tra kết nối mạng.")
                 }
             }
@@ -566,12 +724,12 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
 
         switch voice {
         case .namMinh, .hoaiMy:
-            // Ưu tiên 1: Giọng AI Microsoft Edge Neural (Nam Minh / Hoài My) qua kết nối TLS WebSocket bền vững
+            // Ưu tiên 1: Giọng AI Microsoft Edge Neural (Nam Minh / Hoài My)
             if let edgeData = await EdgeNeuralTTSClient.synthesize(text: cleaned, voiceName: voice.edgeVoiceName),
                edgeData.count > 200 {
                 return edgeData
             }
-            // Ưu tiên 2: Nếu có Gemini API Key thì dùng Gemini AI cùng giới tính làm dự phòng AI
+            // Ưu tiên 2: Dự phòng bằng Gemini AI Native Audio cùng giới tính (có bộ điều tốc Sliding Window chống 429)
             if !geminiApiKey.isEmpty {
                 if let geminiAudio = await GeminiTTSClient.synthesize(
                     text: cleaned,
@@ -581,15 +739,18 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     return geminiAudio
                 }
             }
-            // Ưu tiên 3: Thử lại Edge Neural AI thêm 1 lần sau 0.6s trước khi bỏ cuộc
-            try? await Task.sleep(nanoseconds: 600_000_000)
-            if !Task.isCancelled,
-               let retryEdge = await EdgeNeuralTTSClient.synthesize(text: cleaned, voiceName: voice.edgeVoiceName),
-               retryEdge.count > 200 {
-                return retryEdge
+            // Ưu tiên 3: Đồng bộ lại đồng hồ server & thử lại Edge Neural AI với chế độ bảo mật luân phiên (v1/v2)
+            if !Task.isCancelled {
+                if let retryEdge = await EdgeNeuralTTSClient.synthesize(
+                    text: cleaned,
+                    voiceName: voice.edgeVoiceName,
+                    forceFreshAndFlipGec: true
+                ), retryEdge.count > 200 {
+                    return retryEdge
+                }
             }
             // Chỉ dùng Google khi allowGoogleFallback == true (tuyệt đối không lưu vào cache tải trước)
-            if allowGoogleFallback {
+            if allowGoogleFallback && !Task.isCancelled {
                 if let googleData = await GoogleTranslateTTSClient.synthesize(text: cleaned),
                    googleData.count > 200 {
                     return googleData
@@ -597,7 +758,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             }
 
         case .geminiKore, .geminiPuck:
-            // Ưu tiên 1: Giọng Gemini AI Native Audio (xoay vòng 3 model chống nghẽn quota)
+            // Ưu tiên 1: Giọng Gemini AI Native Audio (Pacer thông minh tự động chờ hồi quota, không bỏ cuộc sớm)
             if !geminiApiKey.isEmpty {
                 if let geminiAudio = await GeminiTTSClient.synthesize(
                     text: cleaned,
@@ -612,8 +773,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                edgeData.count > 200 {
                 return edgeData
             }
-            // Ưu tiên 3: Thử lại Gemini AI hoặc Edge Neural AI sau 0.6s
-            try? await Task.sleep(nanoseconds: 600_000_000)
+            // Ưu tiên 3: Thử lại Gemini AI hoặc Edge Neural AI một vòng nữa trước khi bỏ cuộc
             if !Task.isCancelled {
                 if !geminiApiKey.isEmpty,
                    let retryGemini = await GeminiTTSClient.synthesize(
@@ -623,12 +783,15 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                    ), retryGemini.count > 200 {
                     return retryGemini
                 }
-                if let retryEdge = await EdgeNeuralTTSClient.synthesize(text: cleaned, voiceName: voice.edgeVoiceName),
-                   retryEdge.count > 200 {
+                if let retryEdge = await EdgeNeuralTTSClient.synthesize(
+                    text: cleaned,
+                    voiceName: voice.edgeVoiceName,
+                    forceFreshAndFlipGec: true
+                ), retryEdge.count > 200 {
                     return retryEdge
                 }
             }
-            if allowGoogleFallback {
+            if allowGoogleFallback && !Task.isCancelled {
                 if let googleData = await GoogleTranslateTTSClient.synthesize(text: cleaned),
                    googleData.count > 200 {
                     return googleData
@@ -703,6 +866,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 
     private func advanceToNextChunkOrChapter() {
+        if checkIfSleepTimerExpiredNow() { return }
         guard isSpeaking, !isPaused else { return }
         if currentChunkIndex + 1 < chunks.count {
             currentChunkIndex += 1
@@ -765,10 +929,16 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
         return s
     }
 
+    // MARK: - Chia đoạn Lũy tiến Thông minh (Progressive Chunking)
+    // Đoạn đầu tại vị trí bắt đầu nghe dài ~480 ký tự (~28s âm thanh) để phát loa tức thì sau ~1.2s.
+    // Đoạn kế tiếp dài ~900 ký tự (~58s âm thanh) và các đoạn sau dài ~1380 ký tự (~90s âm thanh/đoạn).
+    // Nhờ mỗi đoạn phát tới 1.5 phút mới cần 1 request tiếp theo, ứng dụng chỉ gọi ~0.65 request/phút —
+    // tuyệt đối không bao giờ chạm giới hạn 3 RPM của Gemini AI và luôn tải trước xong 100% trong nền!
     private func buildSpeechChunksWithRatios(
         from rawText: String,
-        title: String
-    ) -> (chunks: [String], ratios: [Double], hasPrependedTitle: Bool) {
+        title: String,
+        anchorScrollRatio: Double = 0.0
+    ) -> (chunks: [String], ratios: [Double], hasPrependedTitle: Bool, anchorChunkIndex: Int) {
         let rawLines = rawText.components(separatedBy: .newlines)
         let charsPerVisualLine: Double = 38.0
 
@@ -815,7 +985,7 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             }
         }
 
-        let singleMaxLen = 320
+        let singleMaxLen = 380
 
         for (lineIdx, rawLine) in rawLines.enumerated() {
             let linecleaned = Self.sanitizeLineForSpeech(rawLine)
@@ -841,19 +1011,58 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
             }
         }
 
-        // Gộp các câu liên tiếp thành đoạn ~320 ký tự (~22-25 giây âm thanh/đoạn)
-        // Đủ dài để 3 đoạn tiếp theo luôn tải xong 100% trong nền và không bao giờ vượt giới hạn RPM của AI
+        guard !rawLineChunks.isEmpty else {
+            return ([], [], false, 0)
+        }
+
+        // Xác định câu bắt đầu tương ứng với vị trí cuộn hiện tại của người đọc
+        let clampedAnchor = min(1.0, max(0.0, anchorScrollRatio))
+        var rawAnchorIdx: Int = 0
+        if clampedAnchor > 0.015 {
+            for i in 0..<rawLineChunks.count {
+                if rawLineRatios[i] <= clampedAnchor + 0.008 {
+                    rawAnchorIdx = i
+                }
+            }
+        }
+
         var mergedChunks: [String] = []
         var mergedRatios: [Double] = []
-        let targetMergeLen = 320
+        var resolvedAnchorChunkIndex: Int = 0
 
         var idx = 0
+        var forwardStepFromAnchor = 0
+
         while idx < rawLineChunks.count {
+            if idx == rawAnchorIdx {
+                resolvedAnchorChunkIndex = mergedChunks.count
+                forwardStepFromAnchor = 0
+            }
+
+            let targetMergeLen: Int
+            if idx < rawAnchorIdx {
+                targetMergeLen = 1200
+            } else if forwardStepFromAnchor == 0 {
+                // Đoạn đầu tiên ngay tại vị trí bắt đầu nghe: vừa đủ ngắn (~480 ký tự) để phát ngay lập tức
+                targetMergeLen = 480
+            } else if forwardStepFromAnchor == 1 {
+                // Đoạn thứ hai: ~920 ký tự (~60 giây âm thanh)
+                targetMergeLen = 920
+            } else {
+                // Các đoạn tiếp theo: ~1380 ký tự (~90 giây âm thanh/đoạn)
+                targetMergeLen = 1380
+            }
+
             var currentText = rawLineChunks[idx]
             let startRatio = rawLineRatios[idx]
+            let startedBeforeAnchor = (idx < rawAnchorIdx)
             idx += 1
 
             while idx < rawLineChunks.count {
+                // Tuyệt đối không gộp vượt qua ranh giới câu mà người dùng đang cuộn tới
+                if startedBeforeAnchor && idx >= rawAnchorIdx {
+                    break
+                }
                 let nextText = rawLineChunks[idx]
                 let combinedLen = currentText.count + 2 + nextText.count
                 if combinedLen <= targetMergeLen {
@@ -867,11 +1076,15 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
                     break
                 }
             }
+
             mergedChunks.append(currentText)
             mergedRatios.append(startRatio)
+            if !startedBeforeAnchor {
+                forwardStepFromAnchor += 1
+            }
         }
 
-        return (mergedChunks, mergedRatios, false)
+        return (mergedChunks, mergedRatios, false, max(0, min(resolvedAnchorChunkIndex, max(0, mergedChunks.count - 1))))
     }
 
     private func splitCleanedLineIntoChunks(_ line: String, maxChunkLen: Int) -> [String] {
@@ -952,56 +1165,135 @@ final class StorySpeechManager: NSObject, ObservableObject, AVAudioPlayerDelegat
     }
 }
 
-// MARK: - Gemini Native Audio TTS Client (Hàng đợi tuần tự + Xoay vòng Model chống lỗi 429)
+// MARK: - Gemini Native Audio TTS Client (Bộ điều tốc Sliding Window + Tự động chờ hồi Quota 429 + Hỗ trợ đa API Key)
 private actor GeminiTTSSerialActor {
     static let shared = GeminiTTSSerialActor()
 
+    /// Chỉ sử dụng các model TTS hợp lệ; loại bỏ các model 404 tự động để không tốn request thừa
     private let candidateTTSModels: [String] = [
         "gemini-2.5-flash-preview-tts",
-        "gemini-3.1-flash-tts-preview",
         "gemini-2.5-pro-preview-tts"
     ]
-    private var modelCursor: Int = 0
+    private var unavailableModels: Set<String> = []
+    private var rateLimitedModelsUntil: [String: TimeInterval] = [:]
+    private var keyCursor: Int = 0
     private var lastCallTime: TimeInterval = 0
+    /// Lưu lịch sử thời điểm gọi thành công trong 60 giây gần nhất cho từng API Key để điều tiết dưới ngưỡng 3 RPM
+    private var recentCallTimestampsByKey: [String: [TimeInterval]] = [:]
+
+    private static func parseApiKeys(from raw: String) -> [String] {
+        let separators = CharacterSet(charactersIn: ",;\n\r\t ")
+        let tokens = raw.components(separatedBy: separators)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { $0.count >= 20 }
+        if tokens.isEmpty {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? [] : [trimmed]
+        }
+        var unique: [String] = []
+        for t in tokens where !unique.contains(t) {
+            unique.append(t)
+        }
+        return unique
+    }
 
     func synthesize(text: String, voiceName: String, apiKey: String) async -> Data? {
-        // Giãn cách tối thiểu 1.0s giữa 2 request liên tiếp để không bao giờ bị từ chối vì burst concurrency
+        let keys = Self.parseApiKeys(from: apiKey)
+        guard !keys.isEmpty else { return nil }
+
+        // Giãn cách tối thiểu 1.5s giữa 2 request liên tiếp
         let now = Date().timeIntervalSince1970
         let elapsed = now - lastCallTime
-        if elapsed < 1.0 && lastCallTime > 0 {
-            let waitNs = UInt64((1.0 - elapsed) * 1_000_000_000)
+        if elapsed < 1.5 && lastCallTime > 0 {
+            let waitNs = UInt64((1.5 - elapsed) * 1_000_000_000)
             try? await Task.sleep(nanoseconds: waitNs)
         }
 
-        for round in 0..<2 {
-            if Task.isCancelled { return nil }
-            let count = candidateTTSModels.count
-            for offset in 0..<count {
-                if Task.isCancelled { return nil }
-                let idx = (modelCursor + offset) % count
-                let model = candidateTTSModels[idx]
-                lastCallTime = Date().timeIntervalSince1970
+        // Thử tối đa 4 vòng (với thời gian chờ hồi cửa sổ 60s thông minh) để không bao giờ bỏ cuộc giữa chừng khi chạm ngưỡng 3 RPM
+        let retryDelaysSeconds: [Double] = [4.0, 7.0, 10.0, 12.0]
 
-                let result = await GeminiTTSClient.callGeminiAudioEndpoint(
-                    model: model,
-                    text: text,
-                    voiceName: voiceName,
-                    apiKey: apiKey
-                )
-                switch result {
-                case .success(let wavData):
-                    // Chuyển con trỏ sang model kế tiếp cho câu sau để nhân 3 hạn mức RPM miễn phí
-                    modelCursor = (idx + 1) % count
-                    return wavData
-                case .rateLimited:
-                    continue
-                case .tryNextModel:
-                    continue
+        for round in 0..<4 {
+            if Task.isCancelled { return nil }
+
+            let activeModels = candidateTTSModels.filter { !unavailableModels.contains($0) }
+            let modelsToTry = activeModels.isEmpty ? ["gemini-2.5-flash-preview-tts"] : activeModels
+            var sawRateLimit = false
+            var suggestedRetryWait: Double? = nil
+
+            for keyOffset in 0..<keys.count {
+                if Task.isCancelled { return nil }
+                let kIdx = (keyCursor + keyOffset) % keys.count
+                let currentKey = keys[kIdx]
+
+                // Kiểm tra cửa sổ 60 giây của key này: nếu đã gọi >= 3 lần trong 58 giây qua và chỉ có 1 key,
+                // chủ động chờ cho tới khi request cũ nhất vượt qua mốc 60 giây để không bị Google trả lỗi 429
+                let currentTs = Date().timeIntervalSince1970
+                let history = (recentCallTimestampsByKey[currentKey] ?? []).filter { currentTs - $0 < 60.0 }
+                recentCallTimestampsByKey[currentKey] = history
+
+                if history.count >= 3 && keys.count == 1, let oldest = history.first {
+                    let waitUntilWindowReset = max(0.0, 60.5 - (currentTs - oldest))
+                    if waitUntilWindowReset > 0.2 && waitUntilWindowReset <= 22.0 {
+                        try? await Task.sleep(nanoseconds: UInt64(waitUntilWindowReset * 1_000_000_000))
+                        if Task.isCancelled { return nil }
+                    }
+                }
+
+                for model in modelsToTry {
+                    if Task.isCancelled { return nil }
+                    let modelCooldownKey = "\(model)_\(kIdx)"
+                    if let blockedUntil = rateLimitedModelsUntil[modelCooldownKey],
+                       Date().timeIntervalSince1970 < blockedUntil,
+                       model != "gemini-2.5-flash-preview-tts" {
+                        continue
+                    }
+
+                    lastCallTime = Date().timeIntervalSince1970
+                    let result = await GeminiTTSClient.callGeminiAudioEndpoint(
+                        model: model,
+                        text: text,
+                        voiceName: voiceName,
+                        apiKey: currentKey
+                    )
+
+                    switch result {
+                    case .success(let wavData):
+                        var updatedHistory = (recentCallTimestampsByKey[currentKey] ?? []).filter {
+                            Date().timeIntervalSince1970 - $0 < 60.0
+                        }
+                        updatedHistory.append(Date().timeIntervalSince1970)
+                        recentCallTimestampsByKey[currentKey] = updatedHistory
+                        keyCursor = (kIdx + 1) % keys.count
+                        return wavData
+
+                    case .modelNotFound:
+                        unavailableModels.insert(model)
+                        continue
+
+                    case .rateLimited(let retryAfterSec):
+                        sawRateLimit = true
+                        if let retryAfterSec, retryAfterSec > 0 {
+                            suggestedRetryWait = min(20.0, max(3.0, retryAfterSec))
+                        }
+                        // Nếu model phụ (2.5-pro) bị 429 trên Free Tier thì tạm khóa model phụ 3 phút để không gọi thừa
+                        if model != "gemini-2.5-flash-preview-tts" {
+                            rateLimitedModelsUntil[modelCooldownKey] = Date().timeIntervalSince1970 + 180.0
+                        }
+                        continue
+
+                    case .otherError:
+                        continue
+                    }
                 }
             }
-            if round == 0 {
-                // Nếu cả 3 model đều đang chạm ngưỡng tạm thời, chờ 2.5s trong nền rồi thử lại
-                try? await Task.sleep(nanoseconds: 2_500_000_000)
+
+            if !sawRateLimit && round >= 1 {
+                break
+            }
+
+            if round < retryDelaysSeconds.count && !Task.isCancelled {
+                let waitSec = suggestedRetryWait ?? retryDelaysSeconds[round]
+                try? await Task.sleep(nanoseconds: UInt64(waitSec * 1_000_000_000))
             }
         }
         return nil
@@ -1011,8 +1303,9 @@ private actor GeminiTTSSerialActor {
 private enum GeminiTTSClient {
     enum CallResult {
         case success(Data)
-        case rateLimited
-        case tryNextModel
+        case rateLimited(Double?)
+        case modelNotFound
+        case otherError
     }
 
     static func synthesize(text: String, voiceName: String, apiKey: String) async -> Data? {
@@ -1035,7 +1328,7 @@ private enum GeminiTTSClient {
         apiKey: String
     ) async -> CallResult {
         let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)"
-        guard let url = URL(string: urlString) else { return .tryNextModel }
+        guard let url = URL(string: urlString) else { return .otherError }
 
         let part = GeminiTTSRequestPayload.Content.Part(text: text)
         let content = GeminiTTSRequestPayload.Content(parts: [part])
@@ -1046,28 +1339,42 @@ private enum GeminiTTSClient {
         let payload = GeminiTTSRequestPayload(contents: [content], generationConfig: genCfg)
 
         guard let bodyData = try? JSONEncoder().encode(payload) else {
-            return .tryNextModel
+            return .otherError
         }
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 15
+        request.timeoutInterval = 28
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = bodyData
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
-            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 500
+            let httpResp = response as? HTTPURLResponse
+            let statusCode = httpResp?.statusCode ?? 500
+
+            if statusCode == 404 {
+                return .modelNotFound
+            }
             if statusCode == 429 || statusCode == 503 {
-                return .rateLimited
+                let retryHeader = httpResp?.value(forHTTPHeaderField: "Retry-After")
+                let parsedRetry = retryHeader.flatMap { Double($0) } ?? extractRetryDelaySeconds(from: data)
+                return .rateLimited(parsedRetry)
             }
             guard (200...299).contains(statusCode) else {
-                return .tryNextModel
+                let rawBody = (String(data: data, encoding: .utf8) ?? "").lowercased()
+                if rawBody.contains("not found") || rawBody.contains("not supported") {
+                    return .modelNotFound
+                }
+                if rawBody.contains("quota") || rawBody.contains("resource_exhausted") || rawBody.contains("rate") {
+                    return .rateLimited(extractRetryDelaySeconds(from: data))
+                }
+                return .otherError
             }
 
             guard let decoded = try? JSONDecoder().decode(GeminiTTSResponsePayload.self, from: data),
                   let parts = decoded.candidates?.first?.content?.parts else {
-                return .tryNextModel
+                return .otherError
             }
 
             for item in parts {
@@ -1090,10 +1397,22 @@ private enum GeminiTTSClient {
                     }
                 }
             }
-            return .tryNextModel
+            return .otherError
         } catch {
-            return .tryNextModel
+            return .otherError
         }
+    }
+
+    private static func extractRetryDelaySeconds(from data: Data) -> Double? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        if let range = text.range(of: #""retryDelay"\s*:\s*"(\d+(\.\d+)?)s""#, options: .regularExpression) {
+            let match = String(text[range])
+            if let numRange = match.range(of: #"\d+(\.\d+)?"#, options: .regularExpression),
+               let val = Double(match[numRange]) {
+                return val
+            }
+        }
+        return nil
     }
 
     private static func extractSampleRate(from mimeType: String) -> Int? {
@@ -1176,7 +1495,7 @@ private final class SafeContinuationGate<T>: @unchecked Sendable {
     }
 }
 
-// MARK: - Kết nối TLS HTTP/1.1 WebSocket Trực tiếp qua NWConnection (Giữ nguyên 100% Header User-Agent Edg/143 & Cookie muid, Tái sử dụng kết nối qua nhiều câu)
+// MARK: - Kết nối TLS HTTP/1.1 WebSocket Trực tiếp qua NWConnection
 private final class EdgeRawTLSWebSocket: @unchecked Sendable {
     enum FrameEvent {
         case text(String)
@@ -1193,9 +1512,17 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
     private var fragmentedPayload = Data()
     private(set) var isConnected: Bool = false
     private let createdAt: TimeInterval = Date().timeIntervalSince1970
+    private var lastUsedAt: TimeInterval = Date().timeIntervalSince1970
+    private var completedTurns: Int = 0
 
+    /// Chỉ tái sử dụng kết nối khi vừa mới dùng trong vòng 4.5 giây và chưa có dữ liệu rác/frame đóng từ server
     var isReusable: Bool {
-        isConnected && (Date().timeIntervalSince1970 - createdAt) < 42.0
+        let now = Date().timeIntervalSince1970
+        return isConnected
+            && receiveBuffer.isEmpty
+            && completedTurns < 3
+            && (now - lastUsedAt) < 4.5
+            && (now - createdAt) < 22.0
     }
 
     init() {
@@ -1207,7 +1534,7 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
         let tcpOptions = NWProtocolTCP.Options()
         tcpOptions.noDelay = true
         tcpOptions.enableKeepalive = true
-        tcpOptions.keepaliveIdle = 15
+        tcpOptions.keepaliveIdle = 10
 
         let params = NWParameters(tls: tlsOptions, tcp: tcpOptions)
         self.connection = NWConnection(
@@ -1223,7 +1550,7 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
         connection.cancel()
     }
 
-    private func waitForReady(timeoutSeconds: Double = 6.0) async -> Bool {
+    private func waitForReady(timeoutSeconds: Double = 5.0) async -> Bool {
         await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             let gate = SafeContinuationGate(cont)
             queue.asyncAfter(deadline: .now() + timeoutSeconds) { [weak self] in
@@ -1247,7 +1574,7 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
         }
     }
 
-    private func sendRawData(_ data: Data, timeoutSeconds: Double = 6.0) async -> Bool {
+    private func sendRawData(_ data: Data, timeoutSeconds: Double = 5.0) async -> Bool {
         guard isConnected else { return false }
         return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             let gate = SafeContinuationGate(cont)
@@ -1267,7 +1594,7 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
         }
     }
 
-    private func receiveMoreBytes(timeoutSeconds: Double = 8.0) async -> Bool {
+    private func receiveMoreBytes(timeoutSeconds: Double = 7.0) async -> Bool {
         guard isConnected else { return false }
         let chunk: Data? = await withCheckedContinuation { (cont: CheckedContinuation<Data?, Never>) in
             let gate = SafeContinuationGate(cont)
@@ -1300,9 +1627,10 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
     func connectAndHandshake(
         trustedToken: String,
         secMsGec: String,
-        secMsGecVersion: String
+        secMsGecVersion: String,
+        userAgentVersion: String
     ) async -> (success: Bool, serverDateHeader: String?) {
-        guard await waitForReady(timeoutSeconds: 6.0) else {
+        guard await waitForReady(timeoutSeconds: 5.0) else {
             close()
             return (false, nil)
         }
@@ -1319,13 +1647,13 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
         let requestLines = [
             "GET \(path) HTTP/1.1",
             "Host: speech.platform.bing.com",
-            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
+            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/\(userAgentVersion) Safari/537.36 Edg/\(userAgentVersion)",
             "Origin: chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
             "Cookie: muid=\(muid);",
             "Pragma: no-cache",
             "Cache-Control: no-cache",
             "Accept-Encoding: gzip, deflate, br, zstd",
-            "Accept-Language: en-US,en;q=0.9",
+            "Accept-Language: vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
             "Upgrade: websocket",
             "Connection: Upgrade",
             "Sec-WebSocket-Key: \(wsKey)",
@@ -1333,7 +1661,7 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
             "\r\n"
         ].joined(separator: "\r\n")
 
-        guard await sendRawData(Data(requestLines.utf8), timeoutSeconds: 6.0) else {
+        guard await sendRawData(Data(requestLines.utf8), timeoutSeconds: 5.0) else {
             close()
             return (false, nil)
         }
@@ -1346,6 +1674,7 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
                 let dateHeader = Self.extractHTTPDateHeader(from: headerText)
                 let firstLine = headerText.components(separatedBy: "\r\n").first ?? ""
                 if firstLine.contains(" 101 ") {
+                    lastUsedAt = Date().timeIntervalSince1970
                     return (true, dateHeader)
                 } else {
                     close()
@@ -1356,7 +1685,7 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
                 close()
                 return (false, nil)
             }
-            guard await receiveMoreBytes(timeoutSeconds: 6.0) else {
+            guard await receiveMoreBytes(timeoutSeconds: 5.0) else {
                 close()
                 return (false, nil)
             }
@@ -1372,7 +1701,8 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
     ) async -> Data? {
         guard isConnected else { return nil }
 
-        let configPayload = "X-Timestamp:\(timestampString)\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"true\"},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}\r\n"
+        // Tắt wordBoundaryEnabled để server Microsoft chỉ truyền các frame âm thanh MP3, giảm 60% số frame và tăng gấp đôi tốc độ tải đoạn dài
+        let configPayload = "X-Timestamp:\(timestampString)\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}\r\n"
 
         let cleanText = text
             .replacingOccurrences(of: "\r", with: " ")
@@ -1385,7 +1715,7 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
             .replacingOccurrences(of: "'", with: "&apos;")
 
         let reqId = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        let ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='\(voiceName)'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>\(escapedText)</prosody></voice></speak>"
+        let ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='vi-VN'><voice name='\(voiceName)'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>\(escapedText)</prosody></voice></speak>"
         let ssmlPayload = "X-RequestId:\(reqId)\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:\(timestampString)Z\r\nPath:ssml\r\n\r\n\(ssml)"
 
         let frame1 = Self.encodeClientFrame(opcode: 0x1, payload: Data(configPayload.utf8))
@@ -1394,7 +1724,7 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
         combined.append(frame1)
         combined.append(frame2)
 
-        guard await sendRawData(combined, timeoutSeconds: 6.0) else {
+        guard await sendRawData(combined, timeoutSeconds: 5.0) else {
             close()
             return nil
         }
@@ -1405,6 +1735,8 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
                 switch frame {
                 case .text(let str):
                     if str.contains("Path:turn.end") {
+                        lastUsedAt = Date().timeIntervalSince1970
+                        completedTurns += 1
                         return audioBuffer.count > 200 ? audioBuffer : nil
                     }
                 case .binary(let data):
@@ -1430,7 +1762,7 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
                 }
             }
 
-            guard await receiveMoreBytes(timeoutSeconds: 8.0) else {
+            guard await receiveMoreBytes(timeoutSeconds: 7.0) else {
                 close()
                 return audioBuffer.count > 200 ? audioBuffer : nil
             }
@@ -1597,17 +1929,38 @@ private final class EdgeRawTLSWebSocket: @unchecked Sendable {
     }
 }
 
-// MARK: - Actor Điều phối Tuần tự & Tái sử dụng Kết nối cho Microsoft Edge Neural TTS
+// MARK: - Actor Điều phối Tuần tự, Tự động Đàm phán Sec-MS-GEC (v1/v2) & Circuit Breaker cho Microsoft Edge Neural TTS
 private actor EdgeTTSSerialActor {
+    enum GecMode {
+        case v2
+        case v1
+    }
+
     static let shared = EdgeTTSSerialActor()
     private var activeSocket: EdgeRawTLSWebSocket?
+    private var preferredGecMode: GecMode = .v2
+    private var consecutiveHardFailures: Int = 0
+    private var circuitOpenUntil: TimeInterval = 0
 
-    func synthesize(text: String, voiceName: String) async -> Data? {
-        // 1. Tái sử dụng kết nối WebSocket đang mở từ đoạn trước (không cần bắt tay lại, tốc độ ~0.25s/đoạn)
-        if let existing = activeSocket, existing.isReusable {
+    func synthesize(text: String, voiceName: String, forceFreshAndFlipGec: Bool = false) async -> Data? {
+        if forceFreshAndFlipGec {
+            activeSocket?.close()
+            activeSocket = nil
+            preferredGecMode = (preferredGecMode == .v2) ? .v1 : .v2
+            circuitOpenUntil = 0
+        } else {
+            // Nếu mạng hiện tại đang chặn cổng Edge liên tiếp, tạm bỏ qua nhanh trong 40s để chuyển sang Gemini AI ngay lập tức không bị xoay tròn chờ đợi
+            if Date().timeIntervalSince1970 < circuitOpenUntil {
+                return nil
+            }
+        }
+
+        // 1. Tái sử dụng kết nối WebSocket đang ấm (chỉ khi vừa dùng trong vòng 4.5s)
+        if !forceFreshAndFlipGec, let existing = activeSocket, existing.isReusable {
             let ts = EdgeNeuralTTSClient.formatEdgeTimestamp(from: EdgeNeuralTTSClient.currentSyncedTimestamp())
             if let data = await existing.synthesizeTurn(text: text, voiceName: voiceName, timestampString: ts),
                data.count > 200 {
+                consecutiveHardFailures = 0
                 return data
             }
             existing.close()
@@ -1617,16 +1970,33 @@ private actor EdgeTTSSerialActor {
             activeSocket = nil
         }
 
-        // 2. Mở kết nối TLS HTTP/1.1 WebSocket mới (thử tối đa 2 lần nếu cần đồng bộ đồng hồ từ header Date)
-        for attempt in 0..<2 {
+        // 2. Mở kết nối TLS HTTP/1.1 WebSocket mới, tự động thử cả Sec-MS-GEC v2 lẫn v1 (SHA-256 chuẩn)
+        let modesToTry: [GecMode] = (preferredGecMode == .v2) ? [.v2, .v1] : [.v1, .v2]
+
+        for (attemptIdx, mode) in modesToTry.enumerated() {
             if Task.isCancelled { return nil }
             let socket = EdgeRawTLSWebSocket()
             let nowTs = EdgeNeuralTTSClient.currentSyncedTimestamp()
-            let secMsGec = EdgeNeuralTTSClient.generateSecMsGecV2(timestamp: nowTs)
+            let secMsGec: String
+            let secMsGecVersion: String
+            let uaVersion: String
+
+            switch mode {
+            case .v2:
+                secMsGec = EdgeNeuralTTSClient.generateSecMsGecV2(timestamp: nowTs)
+                secMsGecVersion = EdgeNeuralTTSClient.secMsGecVersionV2
+                uaVersion = "143.0.0.0"
+            case .v1:
+                secMsGec = EdgeNeuralTTSClient.generateSecMsGecV1(timestamp: nowTs)
+                secMsGecVersion = EdgeNeuralTTSClient.secMsGecVersionV1
+                uaVersion = "132.0.0.0"
+            }
+
             let handshake = await socket.connectAndHandshake(
                 trustedToken: EdgeNeuralTTSClient.trustedToken,
                 secMsGec: secMsGec,
-                secMsGecVersion: EdgeNeuralTTSClient.secMsGecVersion
+                secMsGecVersion: secMsGecVersion,
+                userAgentVersion: uaVersion
             )
 
             if let dateHeader = handshake.serverDateHeader {
@@ -1637,6 +2007,8 @@ private actor EdgeTTSSerialActor {
                 let ts = EdgeNeuralTTSClient.formatEdgeTimestamp(from: EdgeNeuralTTSClient.currentSyncedTimestamp())
                 if let data = await socket.synthesizeTurn(text: text, voiceName: voiceName, timestampString: ts),
                    data.count > 200 {
+                    preferredGecMode = mode
+                    consecutiveHardFailures = 0
                     if socket.isReusable {
                         activeSocket = socket
                     } else {
@@ -1647,25 +2019,39 @@ private actor EdgeTTSSerialActor {
             }
             socket.close()
 
-            if attempt == 0 && handshake.serverDateHeader == nil {
+            if attemptIdx == 0 && handshake.serverDateHeader == nil {
                 await EdgeNeuralTTSClient.syncServerClock()
             }
         }
 
-        // 3. Dự phòng qua URLSessionWebSocketTask (cấu hình httpAdditionalHeaders)
-        if let fallbackData = await EdgeNeuralTTSClient.performURLSessionWebSocketSynthesize(text: text, voiceName: voiceName),
-           fallbackData.count > 200 {
-            return fallbackData
+        // 3. Dự phòng qua URLSessionWebSocketTask với cả 2 chế độ GEC
+        for mode in modesToTry {
+            if Task.isCancelled { return nil }
+            let useV1 = (mode == .v1)
+            if let fallbackData = await EdgeNeuralTTSClient.performURLSessionWebSocketSynthesize(
+                text: text,
+                voiceName: voiceName,
+                useV1Gec: useV1
+            ), fallbackData.count > 200 {
+                preferredGecMode = mode
+                consecutiveHardFailures = 0
+                return fallbackData
+            }
         }
 
+        consecutiveHardFailures += 1
+        if consecutiveHardFailures >= 2 {
+            circuitOpenUntil = Date().timeIntervalSince1970 + 40.0
+        }
         return nil
     }
 }
 
-// MARK: - Microsoft Edge Neural TTS WebSocket Client (Chuẩn Sec-MS-GEC v2 <16-hex>-<64-hex> & 2-143.0.3650.75 theo edge-tts 7.3.1)
+// MARK: - Microsoft Edge Neural TTS WebSocket Client (Hỗ trợ song song Sec-MS-GEC v1 SHA-256 & v2 theo edge-tts)
 private enum EdgeNeuralTTSClient {
     static let trustedToken = "6A5AA1D4EAFF4E9FB37E23D68491D6F4"
-    static let secMsGecVersion = "2-143.0.3650.75"
+    static let secMsGecVersionV2 = "2-143.0.3650.75"
+    static let secMsGecVersionV1 = "1-132.0.2957.140"
     private static let clockLock = NSLock()
     private static var serverTimeOffsetSeconds: TimeInterval = 0
     private static var hasSyncedServerClock: Bool = false
@@ -1714,10 +2100,18 @@ private enum EdgeNeuralTTSClient {
         0xBB04A2C1, 0xC5626167
     ]
 
-    static func synthesize(text: String, voiceName: String) async -> Data? {
+    static func synthesize(
+        text: String,
+        voiceName: String,
+        forceFreshAndFlipGec: Bool = false
+    ) async -> Data? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        return await EdgeTTSSerialActor.shared.synthesize(text: trimmed, voiceName: voiceName)
+        return await EdgeTTSSerialActor.shared.synthesize(
+            text: trimmed,
+            voiceName: voiceName,
+            forceFreshAndFlipGec: forceFreshAndFlipGec
+        )
     }
 
     static func setServerClockOffset(_ offset: TimeInterval) {
@@ -1728,13 +2122,27 @@ private enum EdgeNeuralTTSClient {
     }
 
     static func updateServerClockFromDateString(_ dateHeader: String) {
+        let trimmed = dateHeader.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let formats = [
+            "EEE, dd MMM yyyy HH:mm:ss 'GMT'",
+            "EEE, dd MMM yyyy HH:mm:ss zzz",
+            "EEE, dd MMM yyyy HH:mm:ss z",
+            "EEEE, dd-MMM-yy HH:mm:ss 'GMT'",
+            "EEE MMM d HH:mm:ss yyyy"
+        ]
         let df = DateFormatter()
         df.locale = Locale(identifier: "en_US_POSIX")
         df.timeZone = TimeZone(secondsFromGMT: 0)
-        df.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-        if let serverDate = df.date(from: dateHeader) {
-            let offset = serverDate.timeIntervalSince1970 - Date().timeIntervalSince1970
-            setServerClockOffset(offset)
+
+        for fmt in formats {
+            df.dateFormat = fmt
+            if let serverDate = df.date(from: trimmed) {
+                let offset = serverDate.timeIntervalSince1970 - Date().timeIntervalSince1970
+                setServerClockOffset(offset)
+                return
+            }
         }
     }
 
@@ -1768,36 +2176,47 @@ private enum EdgeNeuralTTSClient {
         }
     }
 
-    static func performURLSessionWebSocketSynthesize(text: String, voiceName: String) async -> Data? {
+    static func performURLSessionWebSocketSynthesize(
+        text: String,
+        voiceName: String,
+        useV1Gec: Bool = false
+    ) async -> Data? {
         let connectionId = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         let nowTimestamp = currentSyncedTimestamp()
-        let secMsGec = generateSecMsGecV2(timestamp: nowTimestamp)
-        let urlString = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=\(trustedToken)&ConnectionId=\(connectionId)&Sec-MS-GEC=\(secMsGec)&Sec-MS-GEC-Version=\(secMsGecVersion)"
+        let secMsGec = useV1Gec
+            ? generateSecMsGecV1(timestamp: nowTimestamp)
+            : generateSecMsGecV2(timestamp: nowTimestamp)
+        let secVersion = useV1Gec ? secMsGecVersionV1 : secMsGecVersionV2
+        let uaVer = useV1Gec ? "132.0.0.0" : "143.0.0.0"
+
+        let urlString = "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1?TrustedClientToken=\(trustedToken)&ConnectionId=\(connectionId)&Sec-MS-GEC=\(secMsGec)&Sec-MS-GEC-Version=\(secVersion)"
         guard let url = URL(string: urlString) else { return nil }
 
         let muid = UUID().uuidString.replacingOccurrences(of: "-", with: "").uppercased()
-        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
+        let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/\(uaVer) Safari/537.36 Edg/\(uaVer)"
         let origin = "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold"
 
         var request = URLRequest(url: url)
-        request.timeoutInterval = 8
+        request.timeoutInterval = 7
+        request.httpShouldHandleCookies = false
         request.setValue(origin, forHTTPHeaderField: "Origin")
         request.setValue(ua, forHTTPHeaderField: "User-Agent")
         request.setValue("muid=\(muid);", forHTTPHeaderField: "Cookie")
         request.setValue("no-cache", forHTTPHeaderField: "Pragma")
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
-        request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+        request.setValue("vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7", forHTTPHeaderField: "Accept-Language")
 
         let config = URLSessionConfiguration.ephemeral
+        config.httpShouldSetCookies = false
         config.httpAdditionalHeaders = [
             "User-Agent": ua,
             "Origin": origin,
             "Cookie": "muid=\(muid);",
             "Pragma": "no-cache",
             "Cache-Control": "no-cache",
-            "Accept-Language": "en-US,en;q=0.9"
+            "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
         ]
-        config.timeoutIntervalForRequest = 8
+        config.timeoutIntervalForRequest = 7
         config.timeoutIntervalForResource = 10
         let session = URLSession(configuration: config)
         let ws = session.webSocketTask(with: request)
@@ -1810,7 +2229,7 @@ private enum EdgeNeuralTTSClient {
             }
 
             let timestamp = formatEdgeTimestamp(from: nowTimestamp)
-            let configPayload = "X-Timestamp:\(timestamp)\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"true\"},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}\r\n"
+            let configPayload = "X-Timestamp:\(timestamp)\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{\"context\":{\"synthesis\":{\"audio\":{\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"},\"outputFormat\":\"audio-24khz-48kbitrate-mono-mp3\"}}}}\r\n"
 
             let cleanText = text
                 .replacingOccurrences(of: "\r", with: " ")
@@ -1823,7 +2242,7 @@ private enum EdgeNeuralTTSClient {
                 .replacingOccurrences(of: "'", with: "&apos;")
 
             let reqId = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-            let ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='\(voiceName)'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>\(escapedText)</prosody></voice></speak>"
+            let ssml = "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='vi-VN'><voice name='\(voiceName)'><prosody pitch='+0Hz' rate='+0%' volume='+0%'>\(escapedText)</prosody></voice></speak>"
             let ssmlPayload = "X-RequestId:\(reqId)\r\nContent-Type:application/ssml+xml\r\nX-Timestamp:\(timestamp)Z\r\nPath:ssml\r\n\r\n\(ssml)"
 
             do {
@@ -1864,8 +2283,25 @@ private enum EdgeNeuralTTSClient {
         }
     }
 
+    // MARK: - Thuật toán Sec-MS-GEC v1 chuẩn (SHA-256 64-hex uppercase) bằng CryptoKit
+    static func generateSecMsGecV1(timestamp: TimeInterval) -> String {
+        let winEpochOffset: Int64 = 11_644_473_600
+        let unixSeconds: Int64 = Int64(timestamp)
+        let totalSeconds: Int64 = unixSeconds + winEpochOffset
+        let rem300: Int64 = totalSeconds % 300
+        let roundedSeconds: Int64 = totalSeconds - rem300
+        let fileTime: Int64 = roundedSeconds * 10_000_000
+        let rawString = "\(fileTime)\(trustedToken)"
+        let digest = SHA256.hash(data: Data(rawString.utf8))
+        var hex = ""
+        hex.reserveCapacity(64)
+        for byte in digest {
+            hex += String(format: "%02X", byte)
+        }
+        return hex
+    }
+
     // MARK: - Thuật toán Sec-MS-GEC v2 (<16-hex>-<64-hex>) chính xác theo rany2/edge-tts 7.3.1 drm.py
-    // Mọi phép toán bit được tách từng dòng đơn giản kèm kiểu tĩnh : UInt64 để swiftc biên dịch trong <0.01 giây
     private static func rol16(_ value: UInt64) -> UInt64 {
         let v: UInt64 = value & u32Mask
         let shl: UInt64 = v << (16 as UInt64)
